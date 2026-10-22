@@ -1,0 +1,13 @@
+package example:primitives;
+
+world primitives {
+  import now: func() -> u64;
+  import print: func(msg: string);
+
+  export add: func(a: u32, b: u32) -> u32;
+  export negate: func(x: s64) -> s64;
+  export scale: func(x: f32, by: f64) -> f64;
+  export is-even: func(n: u8) -> bool;
+  export next-char: func(c: char) -> char;
+  export greet: func(name: string) -> string;
+}

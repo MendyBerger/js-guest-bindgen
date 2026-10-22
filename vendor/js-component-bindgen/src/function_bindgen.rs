@@ -1,0 +1,4434 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
+use std::mem;
+
+use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use wasmtime_environ::component::{
+    InterfaceType, ResourceIndex, RuntimeCallbackIndex, RuntimeComponentInstanceIndex,
+    RuntimeMemoryIndex, RuntimeReallocIndex, TypeComponentLocalErrorContextTableIndex,
+    TypeFutureTableIndex, TypeResourceTableIndex, TypeStreamTableIndex,
+};
+use wit_bindgen_core::abi::{Bindgen, Bitcast, Instruction};
+use wit_component::StringEncoding;
+use wit_parser::abi::WasmType;
+use wit_parser::{
+    Alignment, ArchitectureSize, Handle, Resolve, SizeAlign, Type, TypeDef, TypeDefKind, TypeId,
+};
+
+use crate::intrinsics::Intrinsic;
+use crate::intrinsics::component::ComponentIntrinsic;
+use crate::intrinsics::conversion::ConversionIntrinsic;
+use crate::intrinsics::js_helper::JsHelperIntrinsic;
+use crate::intrinsics::lift::LiftIntrinsic;
+use crate::intrinsics::p3::async_future::AsyncFutureIntrinsic;
+use crate::intrinsics::p3::async_stream::AsyncStreamIntrinsic;
+use crate::intrinsics::p3::async_task::AsyncTaskIntrinsic;
+use crate::intrinsics::resource::ResourceIntrinsic;
+use crate::intrinsics::string::StringIntrinsic;
+use crate::{ManagesIntrinsics, get_thrown_type, source};
+use crate::{uwrite, uwriteln};
+
+/// Method of error handling
+#[derive(Debug, Clone, PartialEq)]
+pub enum ErrHandling {
+    /// Do no special handling of errors, requiring users to return objects that represent
+    /// errors as represented in WIT
+    None,
+    /// Require throwing of result error objects
+    ThrowResultErr,
+    /// Catch thrown errors and convert them into result<t,e> error variants
+    ResultCatchHandler,
+}
+
+impl ErrHandling {
+    fn to_js_string(&self) -> String {
+        match self {
+            ErrHandling::None => "none".into(),
+            ErrHandling::ThrowResultErr => "throw-result-err".into(),
+            ErrHandling::ResultCatchHandler => "result-catch-handler".into(),
+        }
+    }
+}
+
+/// Data related to a given resource
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResourceData {
+    Host {
+        tid: TypeResourceTableIndex,
+        rid: ResourceIndex,
+        component_idx: RuntimeComponentInstanceIndex,
+        needs_task_context: bool,
+        local_name: String,
+        dtor_name: Option<String>,
+    },
+    Guest {
+        resource_name: String,
+        prefix: Option<String>,
+        extra: Option<ResourceExtraData>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PayloadTypeMetadata {
+    pub(crate) ty: Type,
+    pub(crate) iface_ty: InterfaceType,
+    /// JS expression that serves as a function that lifts a given type
+    pub(crate) lift_js_expr: String,
+    /// JS expression that serves as a function that lowers a given type
+    pub(crate) lower_js_expr: String,
+    pub(crate) size32: u32,
+    pub(crate) align32: u32,
+    pub(crate) flat_count: Option<u8>,
+}
+
+/// Supplemental data kept along with [`ResourceData`]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResourceExtraData {
+    Stream {
+        table_idx: TypeStreamTableIndex,
+        elem_ty: Option<PayloadTypeMetadata>,
+    },
+    Future {
+        table_idx: TypeFutureTableIndex,
+        elem_ty: Option<PayloadTypeMetadata>,
+        nesting_level: u32,
+    },
+    ErrorContext {
+        table_idx: TypeComponentLocalErrorContextTableIndex,
+    },
+}
+
+/// Map used for resource function bindgen within a given component
+///
+/// Mapping from the instance + resource index in that component (internal or external)
+/// to the unique global resource id used to key the resource tables for this resource.
+///
+/// The id value uniquely identifies the resource table so that if a resource is used
+/// by n components, there should be n different indices and spaces in use. The map is
+/// therefore entirely unique and fully distinct for each instance's function bindgen.
+///
+/// The second bool is true if it is an imported resource.
+///
+/// For a given resource table id {x}, with resource index {y} the local variables are assumed:
+/// - handleTable{x}
+/// - captureTable{y} (rep to instance map for captured imported tables, only for JS import bindgen, not hybrid)
+/// - captureCnt{y} for assigning capture rep
+///
+/// For component-defined resources:
+/// - finalizationRegistry{x}
+///
+/// handleTable internally will be allocated with { rep: i32, own: bool } entries
+///
+/// In the case of an imported resource tables, in place of "rep" we just store
+/// the direct JS object being referenced, since in JS the object is its own handle.
+///
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceTable {
+    /// Whether a resource was imported
+    ///
+    /// This should be tracked because imported types cannot be re-exported uniquely (?)
+    pub imported: bool,
+
+    /// Data related to the actual resource
+    pub data: ResourceData,
+}
+
+/// A mapping of type IDs to the resources that they represent
+pub type ResourceMap = BTreeMap<TypeId, ResourceTable>;
+
+#[derive(bon::Builder)]
+#[non_exhaustive]
+pub struct FunctionBindgen<'a> {
+    /// Skip task management for generated function calls. Defaults to `false`.
+    ///
+    /// This is normally used by embedders when they want to run generated bindings
+    /// inside a wasm guest and let the native embedding manage execution and
+    /// canonical abi call lifetimes instead of the host task runtime.
+    #[builder(default)]
+    pub skip_fn_call_task_management: bool,
+
+    /// Mapping of resources for types that have corresponding definitions locally
+    pub resource_map: &'a ResourceMap,
+
+    /// Whether current resource borrows need to be deactivated
+    pub clear_resource_borrows: bool,
+
+    /// Set of intrinsics
+    pub intrinsics: &'a mut BTreeSet<Intrinsic>,
+
+    /// Whether to perform valid lifting optimization
+    pub valid_lifting_optimization: bool,
+    /// Whether WIT flags are represented as bigint values.
+    #[builder(default)]
+    pub flags_as_bigint: bool,
+    /// Whether WIT enum values use SCREAMING_SNAKE_CASE strings.
+    #[builder(default)]
+    pub enum_values_screaming_snake_case: bool,
+
+    /// Sizes and alignments for sub elements
+    pub sizes: &'a SizeAlign,
+
+    /// Method of error handling
+    pub err: ErrHandling,
+
+    /// Temporary values
+    pub tmp: usize,
+
+    /// Source code of the function
+    pub src: source::Source,
+
+    /// Block storage
+    pub block_storage: Vec<source::Source>,
+
+    /// Blocks of the function
+    pub blocks: Vec<(String, Vec<String>)>,
+
+    /// Parameters of the function
+    pub params: Vec<String>,
+
+    /// Memory variable
+    pub memory: Option<&'a String>,
+
+    /// Realloc function name
+    pub realloc: Option<&'a String>,
+
+    /// Synchronous deallocator for owned canonical ABI buffers.
+    pub dealloc: Option<&'a String>,
+
+    /// Post return function name
+    pub post_return: Option<&'a String>,
+
+    /// Prefix to use when printing tracing information
+    pub tracing_prefix: &'a String,
+
+    /// Whether tracing is enabled
+    pub tracing_enabled: bool,
+
+    /// Whether top-level result errors should be thrown as their raw lifted payload.
+    pub no_component_error_wrapping: bool,
+
+    /// Method if string encoding
+    pub encoding: StringEncoding,
+
+    /// Callee of the function
+    pub callee: &'a str,
+
+    /// Whether the callee is dynamic (i.e. has multiple operands)
+    pub callee_resource_dynamic: bool,
+
+    /// The [`wit_bindgen::Resolve`] containing extracted WIT information
+    pub resolve: &'a Resolve,
+
+    /// Whether the function requires async porcelain
+    ///
+    /// In the case of an import this likely implies the use of JSPI
+    /// and in the case of an export this is simply code generation metadata.
+    pub requires_async_porcelain: bool,
+
+    /// Whether the function is guest async lifted (i.e. WASI P3)
+    pub is_async: bool,
+
+    /// Whether the canonical ABI call itself is async.
+    ///
+    /// This can differ from `is_async` when an async component function is
+    /// canonically lifted from a synchronous core function.
+    pub canonical_abi_async: bool,
+    /// Whether the component-level function type is `async` (independently of
+    /// how it was lifted or lowered)
+    pub func_type_async: bool,
+    /// The interned index of the result tuple type of an exported function,
+    /// which `task.return` must match
+    pub return_result_type_idx: Option<u32>,
+
+    /// Whether an async export returning a future needs a non-async outer
+    /// function to preserve the future as a distinct awaitable layer.
+    pub wrap_async_future_result: bool,
+
+    /// Component result type, used to lift callbackless async core returns.
+    pub result_ty: Option<&'a Type>,
+
+    /// Interface name
+    pub iface_name: Option<&'a str>,
+
+    /// Whether the callee was transpiled from Wasm to JS (asm.js) and thus needs shimming for i64
+    pub asmjs: bool,
+
+    /// Component state generated from processing a component.
+    ///
+    /// This information is normally accessible via producing/having
+    /// access to a [`wasmtime_environ::component::Component`]), and
+    /// is required for *some* bindgen instructions.
+    ///
+    /// If you are performing bindgen aganist a dummy module, you may omit this field, but if
+    /// processing has been performed on the component, and this state is available at time of generation for
+    /// this function, provide this information (normally found in [`CanonicalOptions`]s)
+    ///
+    pub component_state: Option<FunctionBindgenComponentState>,
+
+    /// Whether the bindgen is being performed for an import
+    /// (false implies generation is being performed for an export)
+    pub(crate) for_import: Option<bool>,
+}
+
+/// Metadata that is derived from processing a component.
+///
+/// This information is often required to perform bindgen completely, *but*
+/// requires component processing which not all downstream bindgen consumers may
+/// perform.
+///
+/// For bindgen consumers that perform generation which requires this information,
+/// the information should be provided.
+///
+#[derive(bon::Builder)]
+#[non_exhaustive]
+pub struct FunctionBindgenComponentState {
+    pub(crate) component_idx: RuntimeComponentInstanceIndex,
+    pub(crate) realloc_fn_idx: Option<RuntimeReallocIndex>,
+    pub(crate) memory_idx: Option<RuntimeMemoryIndex>,
+    pub(crate) callback_fn_idx: Option<RuntimeCallbackIndex>,
+}
+
+/// JS expressions that resolve to or return component state
+#[derive(bon::Builder)]
+#[non_exhaustive]
+pub struct ComponentStateJsExprs {
+    /// JS expression that is a number, e.g. "0"
+    pub(crate) component_idx: String,
+    /// JS expression that is the generated name of the callback, e.g. "callback_1"
+    pub(crate) callback_fn_name: String,
+    /// JS function expression that returns the callback function for this function, e.g. "() => callback_1"
+    pub(crate) get_callback_fn: String,
+    /// JS expression that is the index of the top-level declared memory associated with this function, e.g. "1"
+    pub(crate) memory_idx: String,
+    /// JS function expression that returns the top-level declared memory associated with this function, e.g. "() => memory0"
+    pub(crate) get_memory_fn: String,
+    /// JS function expression that returns the realloc fn relevant to this function, e.g. "() => realloc0"
+    pub(crate) get_realloc_fn: String,
+}
+
+impl FunctionBindgenComponentState {
+    /// Get JS expressions that represent the bindgen state
+    ///
+    /// When certain values are missing either `null` or `() => null` JS expressions are returned
+    ///
+    fn get_js_exprs(&self) -> ComponentStateJsExprs {
+        ComponentStateJsExprs {
+            component_idx: self.component_idx.as_u32().to_string(),
+            callback_fn_name: match self.callback_fn_idx {
+                Some(idx) => format!("callback_{}", idx.as_u32()),
+                None => "null".into(),
+            },
+            get_callback_fn: match self.callback_fn_idx {
+                Some(idx) => format!("() => callback_{}", idx.as_u32()),
+                None => "() => null".into(),
+            },
+            memory_idx: match self.memory_idx {
+                Some(idx) => idx.as_u32().to_string(),
+                None => "null".into(),
+            },
+            get_memory_fn: match self.memory_idx {
+                Some(idx) => format!("() => memory{}", idx.as_u32()),
+                None => "() => null".into(),
+            },
+            get_realloc_fn: match self.realloc_fn_idx {
+                Some(idx) => format!("() => realloc{}", idx.as_u32()),
+                None => "undefined".into(),
+            },
+        }
+    }
+}
+
+/// Returns whether an `ok`/`err` tagged object can unambiguously be interpreted
+/// as an explicitly wrapped result returned by a host import.
+///
+/// Hosts have historically returned the raw success payload, so that
+/// interpretation takes precedence whenever the payload itself can have the
+/// corresponding tag.
+fn unambiguous_result_wrapper_tags(resolve: &Resolve, ty: Option<&Type>) -> (bool, bool) {
+    let Some(ty) = ty else {
+        return (true, true);
+    };
+    let Type::Id(id) = ty else {
+        return (true, true);
+    };
+
+    match &resolve.types[crate::dealias(resolve, *id)].kind {
+        TypeDefKind::Variant(variant) => (
+            !variant.cases.iter().any(|case| case.name == "ok"),
+            !variant.cases.iter().any(|case| case.name == "err"),
+        ),
+        TypeDefKind::Result(_) => (false, false),
+        TypeDefKind::Record(record) => {
+            let unambiguous = !record.fields.iter().any(|field| field.name == "tag");
+            (unambiguous, unambiguous)
+        }
+        TypeDefKind::Flags(flags) => {
+            let unambiguous = !flags.flags.iter().any(|flag| flag.name == "tag");
+            (unambiguous, unambiguous)
+        }
+        TypeDefKind::Option(payload) => unambiguous_result_wrapper_tags(resolve, Some(payload)),
+        _ => (true, true),
+    }
+}
+
+fn instruction_requires_task_runtime(inst: &Instruction<'_>) -> bool {
+    matches!(
+        inst,
+        Instruction::CallInterface { async_: true, .. }
+            | Instruction::AsyncTaskReturn { .. }
+            | Instruction::FutureLift { .. }
+            | Instruction::FutureLower { .. }
+            | Instruction::StreamLift { .. }
+            | Instruction::StreamLower { .. }
+            | Instruction::ErrorContextLift
+            | Instruction::ErrorContextLower
+    )
+}
+
+impl FunctionBindgen<'_> {
+    fn validate_task_management(&self) {
+        if !self.skip_fn_call_task_management {
+            return;
+        }
+        assert!(
+            !self.is_async && !self.canonical_abi_async && !self.wrap_async_future_result,
+            "Skipping task management requires the synchronous canonical ABI"
+        );
+        assert!(
+            !self.asmjs,
+            "Skipping task management does not support asm.js"
+        );
+        assert!(
+            self.resource_map
+                .values()
+                .all(|table| matches!(table.data, ResourceData::Guest { extra: None, .. })),
+            "Skipping task management requires guest resource tables without async metadata"
+        );
+    }
+
+    fn tmp(&mut self) -> usize {
+        let ret = self.tmp;
+        self.tmp += 1;
+        ret
+    }
+
+    fn intrinsic(&mut self, intrinsic: Intrinsic) -> String {
+        self.intrinsics.insert(intrinsic);
+        intrinsic.name().to_string()
+    }
+
+    // Task-only templates may be built unconditionally, but must only be emitted
+    // when task management is enabled.
+    fn task_intrinsic(&mut self, intrinsic: Intrinsic) -> String {
+        if !self.skip_fn_call_task_management {
+            self.intrinsic(intrinsic)
+        } else {
+            intrinsic.name().to_string()
+        }
+    }
+
+    fn emit_dealloc(&mut self, ptr: &str, len: &str, size: usize, align: usize) {
+        let Some(dealloc) = self.dealloc else {
+            return;
+        };
+        if size == 0 {
+            return;
+        }
+        let byte_size = if size == 1 {
+            len.to_string()
+        } else {
+            format!("{len} * {size}")
+        };
+        uwriteln!(
+            self.src,
+            "if ({len} !== 0) {dealloc}({ptr}, {byte_size}, {align});"
+        );
+    }
+
+    fn emit_list_bounds_check(&mut self, ptr: &str, len: &str, element_size: usize) {
+        const MAX_LIST_BYTE_LENGTH: usize = (1 << 28) - 1;
+
+        let memory = self.memory.as_ref().unwrap().to_string();
+        let runtime_error = self.intrinsic(Intrinsic::WebAssemblyRuntimeError);
+        if let Some(max_elements) = MAX_LIST_BYTE_LENGTH.checked_div(element_size) {
+            uwriteln!(
+                self.src,
+                "if ({ptr} < 0 || {len} < 0 || {len} > {max_elements} || {ptr} > {memory}.buffer.byteLength || {len} > Math.floor(({memory}.buffer.byteLength - {ptr}) / {element_size})) throw new {runtime_error}('wasm trap: out of bounds memory access');"
+            );
+        } else {
+            uwriteln!(
+                self.src,
+                "if ({ptr} < 0 || {len} < 0 || {ptr} > {memory}.buffer.byteLength) throw new {runtime_error}('wasm trap: out of bounds memory access');"
+            );
+        }
+    }
+
+    fn emit_guest_dealloc(&mut self, ptr: &str, len: &str, size: usize, align: usize) {
+        if size == 0 {
+            return;
+        }
+        assert!(
+            self.dealloc.is_some(),
+            "guest deallocation requires a dealloc function"
+        );
+        self.emit_dealloc(ptr, len, size, align);
+    }
+
+    fn emit_dealloc_list_or_map(&mut self, operands: &[String], size: usize, align: usize) {
+        let (body, results) = self.blocks.pop().unwrap();
+        assert!(results.is_empty());
+        if size == 0 {
+            return;
+        }
+
+        let tmp = self.tmp();
+        let ptr = format!("ptr{tmp}");
+        let len = format!("len{tmp}");
+        uwriteln!(self.src, "const {ptr} = ({}) >>> 0;", operands[0]);
+        uwriteln!(self.src, "const {len} = ({}) >>> 0;", operands[1]);
+        if !body.is_empty() {
+            uwriteln!(
+                self.src,
+                "for (let i = 0; i < {len}; i++) {{
+                    const base = {ptr} + i * {size};
+                    {body}
+                }}"
+            );
+        }
+        self.emit_guest_dealloc(&ptr, &len, size, align);
+    }
+
+    fn lift_callbackless_async_result(&mut self) -> Option<(String, String)> {
+        if !self.is_async || self.for_import.unwrap_or_default() {
+            return None;
+        }
+
+        let Type::Id(id) = self.result_ty? else {
+            return None;
+        };
+        let type_id = crate::dealias(self.resolve, *id);
+        let resource = self.resource_map.get(&type_id)?;
+        let (lift_intrinsic, table_idx, table_field) = match resource {
+            ResourceTable {
+                imported: true,
+                data:
+                    ResourceData::Guest {
+                        extra: Some(ResourceExtraData::Future { table_idx, .. }),
+                        ..
+                    },
+            } => (
+                LiftIntrinsic::LiftFlatFuture,
+                table_idx.as_u32(),
+                "futureTableIdx",
+            ),
+            ResourceTable {
+                imported: true,
+                data:
+                    ResourceData::Guest {
+                        extra: Some(ResourceExtraData::Stream { table_idx, .. }),
+                        ..
+                    },
+            } => (
+                LiftIntrinsic::LiftFlatStream,
+                table_idx.as_u32(),
+                "streamTableIdx",
+            ),
+            _ => return None,
+        };
+
+        let component_idx = self
+            .component_state
+            .as_ref()
+            .map(|state| state.get_js_exprs().component_idx)
+            .unwrap_or_else(|| "-1".into());
+        let lift_fn = self.intrinsic(Intrinsic::Lift(lift_intrinsic));
+        let result_var = format!("directAsyncResult{}", self.tmp());
+        let code = format!(
+            r#"
+              const [{result_var}] = {lift_fn}({{
+                  {table_field}: {table_idx},
+                  componentIdx: {component_idx},
+              }})({{
+                  componentIdx: {component_idx},
+                  params: [ret],
+                  useDirectParams: true,
+                  isBorrowed: false,
+              }});
+            "#,
+        );
+        Some((code, result_var))
+    }
+
+    fn clamp_guest<T>(&mut self, results: &mut Vec<String>, operands: &[String], min: T, max: T)
+    where
+        T: std::fmt::Display,
+    {
+        let clamp = self.intrinsic(Intrinsic::ClampGuest);
+        results.push(format!("{}({}, {}, {})", clamp, operands[0], min, max));
+    }
+
+    fn load(
+        &mut self,
+        method: &str,
+        offset: ArchitectureSize,
+        operands: &[String],
+        results: &mut Vec<String>,
+    ) {
+        let view = self.intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::DataView));
+        let Some(memory) = self.memory.as_ref() else {
+            panic!(
+                "unexpectedly missing memory during bindgen for interface [{:?}] (callee {})",
+                self.iface_name, self.callee,
+            );
+        };
+        results.push(format!(
+            "{view}({memory}).{method}(({}) + {offset}, true)",
+            operands[0],
+            offset = offset.size_wasm32()
+        ));
+    }
+
+    fn store(&mut self, method: &str, offset: ArchitectureSize, operands: &[String]) {
+        let view = self.intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::DataView));
+        let memory = self.memory.as_ref().unwrap();
+        uwriteln!(
+            self.src,
+            "{view}({memory}).{method}(({}) + {offset}, {}, true);",
+            operands[1],
+            operands[0],
+            offset = offset.size_wasm32()
+        );
+    }
+
+    /// Write result assignment lines to output
+    ///
+    /// In general this either means writing preambles, for example that look like the following:
+    ///
+    /// ```js
+    /// let ret =
+    /// ```
+    ///
+    /// ```js
+    /// var [ ret0, ret1, ret2 ] =
+    /// ```
+    ///
+    /// ```js
+    /// let ret;
+    /// ```
+    ///
+    /// This function returns as a first tuple parameter a list of
+    /// variables that should be created via let statements beforehand.
+    ///
+    /// # Arguments
+    ///
+    /// * `amt` - number of results
+    /// * `results` - list of variables that will be returned
+    ///
+    fn generate_result_assignment_lhs(
+        &mut self,
+        amt: usize,
+        results: &mut Vec<String>,
+        is_async: bool,
+    ) -> (String, String) {
+        let mut s = String::new();
+        let mut vars_init = String::new();
+        match amt {
+            0 => {
+                // Async functions with no returns still return async code,
+                // which will be used as the initial callback result going into the async driver
+                if is_async {
+                    uwrite!(s, "ret = ")
+                }
+                uwriteln!(vars_init, "let ret;");
+            }
+            1 => {
+                uwrite!(s, "ret = ");
+                results.push("ret".to_string());
+                uwriteln!(vars_init, "let ret;");
+            }
+            n => {
+                uwrite!(s, "[");
+                for i in 0..n {
+                    if i > 0 {
+                        uwrite!(s, ", ");
+                    }
+                    uwrite!(s, "ret{i}");
+                    results.push(format!("ret{i}"));
+                    uwriteln!(vars_init, "let ret;");
+                }
+                uwrite!(s, "] = ");
+            }
+        }
+        (vars_init, s)
+    }
+
+    fn bitcast(&mut self, cast: &Bitcast, op: &str) -> String {
+        match cast {
+            Bitcast::I32ToF32 => {
+                let cvt = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::I32ToF32));
+                format!("{cvt}({op})")
+            }
+            Bitcast::F32ToI32 => {
+                let cvt = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::F32ToI32));
+                format!("{cvt}({op})")
+            }
+            Bitcast::I64ToF64 => {
+                let cvt = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::I64ToF64));
+                format!("{cvt}({op})")
+            }
+            Bitcast::F64ToI64 => {
+                let cvt = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::F64ToI64));
+                format!("{cvt}({op})")
+            }
+            Bitcast::I32ToI64 => format!("BigInt({op})"),
+            Bitcast::I64ToI32 => format!("Number({op})"),
+            Bitcast::I64ToF32 => {
+                let cvt = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::I32ToF32));
+                format!("{cvt}(Number({op}))")
+            }
+            Bitcast::F32ToI64 => {
+                let cvt = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::F32ToI32));
+                format!("BigInt({cvt}({op}))")
+            }
+            Bitcast::None
+            | Bitcast::P64ToI64
+            | Bitcast::LToI32
+            | Bitcast::I32ToL
+            | Bitcast::LToP
+            | Bitcast::PToL => op.to_string(),
+            Bitcast::PToI32 => format!("({op} | 0)"),
+            Bitcast::I32ToP => format!("({op} >>> 0)"),
+            Bitcast::PToP64 | Bitcast::I64ToP64 | Bitcast::LToI64 => format!("BigInt({op})"),
+            Bitcast::P64ToP => format!("(Number({op}) >>> 0)"),
+            Bitcast::I64ToL => format!("Number({op})"),
+            Bitcast::Sequence(casts) => {
+                let mut statement = op.to_string();
+                for cast in casts.iter() {
+                    statement = self.bitcast(cast, &statement);
+                }
+                statement
+            }
+        }
+    }
+
+    /// Start and enter the task for a call into a guest Wasm export.
+    ///
+    /// This must run before canonical argument lowering because lowering may
+    /// invoke guest core exports such as `realloc`, which can access task-local
+    /// context in WASI P3 components.
+    pub(crate) fn start_wasm_export_task(&mut self) {
+        self.validate_task_management();
+        if self.skip_fn_call_task_management {
+            return;
+        }
+        let is_async = self.is_async;
+        let is_manual_async = self.requires_async_porcelain;
+        let preserve_future_result = self.wrap_async_future_result;
+        let fn_name = self.callee;
+        let err_handling = self.err.to_js_string();
+        let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+        let get_component_state = self.intrinsic(Intrinsic::Component(
+            ComponentIntrinsic::GetOrCreateAsyncState,
+        ));
+        let start_current_task_fn = self.intrinsic(Intrinsic::AsyncTask(
+            AsyncTaskIntrinsic::CreateNewCurrentTask,
+        ));
+        let current_task_may_block = self.intrinsic(Intrinsic::AsyncTask(
+            AsyncTaskIntrinsic::CurrentTaskMayBlock,
+        ));
+
+        let (component_idx_expr, get_callback_fn_expr, callback_fn_name) =
+            if let Some(state) = &self.component_state {
+                let ComponentStateJsExprs {
+                    component_idx,
+                    callback_fn_name,
+                    get_callback_fn,
+                    ..
+                } = state.get_js_exprs();
+                (component_idx, get_callback_fn, callback_fn_name)
+            } else {
+                ("1".into(), "() => null".into(), "null".into())
+            };
+
+        uwriteln!(
+            self.src,
+            r#"
+              const hostProvided = false;
+              {get_component_state}({component_idx_expr}).throwIfTrapped();
+
+              const [task, _wasm_call_currentTaskID] = {start_current_task_fn}({{
+                  componentIdx: {component_idx_expr},
+                  isAsync: {is_async},
+                  isManualAsync: {is_manual_async},
+                  preserveFutureResult: {preserve_future_result},
+                  entryFnName: '{fn_name}',
+                  getCallbackFn: {get_callback_fn_expr},
+                  callbackFnName: {callback_fn_name},
+                  errHandling: '{err_handling}',
+                  callingWasmExport: true,
+              }});
+              task.setCalleeIsAsync({canonical_abi_async});
+              task.setFuncTypeIsAsync({func_type_async});
+              {set_return_result_type_idx}
+            "#,
+            canonical_abi_async = self.canonical_abi_async,
+            func_type_async = self.func_type_async,
+            set_return_result_type_idx = self
+                .return_result_type_idx
+                .map(|idx| format!("task.setReturnResultTypeIdx({idx});"))
+                .unwrap_or_default(),
+        );
+
+        if self.is_async || self.requires_async_porcelain {
+            uwriteln!(
+                self.src,
+                r#"
+                  const started = await task.enter();
+                  if (!started) {{
+                      {debug_log_fn}('[Instruction::AsyncTaskReturn] failed to enter task', {{
+                          taskID: task.id(),
+                          subtaskID: task.currentSubtask()?.id(),
+                      }});
+                      // (the deadlock detector records why entry was given up on)
+                      throw task.isErrored() ?? new Error("failed to enter task");
+                  }}
+                  // The store may have trapped while this task waited to enter: nothing
+                  // runs after a trap (Canonical ABI), so this call fails too.
+                  try {{
+                      {get_component_state}({component_idx_expr}).throwIfInterrupted();
+                  }} catch (err) {{
+                      task.setErrored(err);
+                      task.reject(err);
+                      task.exit({{ skipExclusiveLockCheck: true }});
+                      throw err;
+                  }}
+                "#,
+            );
+        } else {
+            uwriteln!(self.src, "const started = task.enterSync();");
+        }
+        uwriteln!(
+            self.src,
+            "{current_task_may_block}.value = task.mayBlock() ? 1 : 0;"
+        );
+
+        if self.callee_resource_dynamic {
+            let resource_borrows =
+                self.intrinsic(Intrinsic::Resource(ResourceIntrinsic::ResourceCallBorrows));
+            let handle_tables = self.intrinsic(Intrinsic::HandleTables);
+            let scope_id = self.intrinsic(Intrinsic::ScopeId);
+            uwriteln!(
+                self.src,
+                r#"
+                  {scope_id}++;
+                  task.registerOnResolveHandler(() => {{
+                      {scope_id}--;
+                      for (const {{ rid, handle }} of {resource_borrows}) {{
+                          const storedScopeId = {handle_tables}[rid][handle << 1]
+                          if (storedScopeId === {scope_id}) {{
+                              throw new TypeError('borrows not dropped for resource call');
+                          }}
+                      }}
+                      {resource_borrows} = [];
+                  }}
+
+                  }});
+                "#
+            );
+            uwriteln!(self.src, "{scope_id}++;");
+        }
+
+        let (memory_idx_expr, get_memory_fn_expr) = if let Some(state) = &self.component_state {
+            let ComponentStateJsExprs {
+                memory_idx,
+                get_memory_fn,
+                ..
+            } = state.get_js_exprs();
+            (memory_idx, get_memory_fn)
+        } else {
+            ("null".into(), "() => null".into())
+        };
+        uwriteln!(
+            self.src,
+            r#"
+              if ({memory_idx_expr} !== null) {{
+                  task.setReturnMemoryIdx({memory_idx_expr});
+                  task.setReturnMemory(({get_memory_fn_expr})());
+              }}
+            "#
+        );
+    }
+
+    /// Run the full canonical adapter body with the export task installed as
+    /// the component's current task. This includes argument lowering and
+    /// result lifting, both of which may call guest core functions.
+    pub(crate) fn begin_wasm_export_body(&mut self) {
+        self.validate_task_management();
+        if self.skip_fn_call_task_management {
+            return;
+        }
+        let is_async = self.is_async || self.requires_async_porcelain;
+        let wrapper = if is_async {
+            self.intrinsic(Intrinsic::WithGlobalCurrentTaskMetaFnAsync)
+        } else {
+            self.intrinsic(Intrinsic::WithGlobalCurrentTaskMetaFn)
+        };
+        if self.is_async {
+            // The caller of an async-lifted export gets the task's result as
+            // soon as the task resolves (Canonical ABI: `on_resolve` runs at
+            // `task.return`), even when the task keeps running afterwards, e.g.
+            // blocked in a synchronous wait. The body's own completion is raced
+            // against that resolution. (A manually async, sync-typed export
+            // resolves when its core function returns, so it needs no race.)
+            let return_task_res = if self.wrap_async_future_result {
+                "{ value: taskRes }"
+            } else {
+                "taskRes"
+            };
+            let throw_result_err = if self.no_component_error_wrapping {
+                "throw taskRes.val;".to_string()
+            } else {
+                let component_err = self.intrinsic(Intrinsic::ComponentError);
+                format!("throw new {component_err}(taskRes.val);")
+            };
+            uwriteln!(
+                self.src,
+                r#"
+                  const finishCompletion = async () => {{
+                      let taskRes = await task.completionPromise();
+                      if (task.getErrHandling() === 'throw-result-err') {{
+                          if (typeof taskRes !== 'object') {{
+                              return {return_task_res};
+                          }}
+                          if (taskRes.tag === 'err') {{ {throw_result_err} }}
+                          if (taskRes.tag === 'ok') {{ taskRes = taskRes.val; }}
+                      }}
+                      return {return_task_res};
+                  }};
+                  const body = {wrapper}({{
+                      taskID: task.id(),
+                      componentIdx: task.componentIdx(),
+                      fn: async () => {{
+                          try {{
+                "#,
+            );
+        } else {
+            let await_ = if is_async { "await " } else { "" };
+            let async_ = if is_async { "async " } else { "" };
+            uwriteln!(
+                self.src,
+                r#"
+                  return {await_}{wrapper}({{
+                      taskID: task.id(),
+                      componentIdx: task.componentIdx(),
+                      fn: {async_}() => {{
+                          try {{
+                "#,
+            );
+        }
+    }
+
+    pub(crate) fn end_wasm_export_body(&mut self) {
+        self.validate_task_management();
+        if self.skip_fn_call_task_management {
+            return;
+        }
+        uwriteln!(
+            self.src,
+            r#"
+                      }} catch (err) {{
+                          if (!task.isResolvedState()) {{
+                              task.setErrored(err);
+                              task.reject(err);
+                          }}
+                          if (!task.isExited()) {{ task.exit({{ skipExclusiveLockCheck: true }}); }}
+                          throw err;
+                      }}
+                  }},
+              }});
+            "#,
+        );
+        if self.is_async {
+            uwriteln!(
+                self.src,
+                r#"
+                  // (a failure after the task resolved is recorded on the store; the
+                  // caller already has, or is about to get, the task's result)
+                  body.catch(() => {{}});
+                  return await Promise.race([body, finishCompletion()]);
+                "#,
+            );
+        }
+    }
+}
+
+impl ManagesIntrinsics for FunctionBindgen<'_> {
+    /// Add an intrinsic, supplying it's name afterwards
+    fn add_intrinsic(&mut self, intrinsic: Intrinsic) {
+        self.intrinsic(intrinsic);
+    }
+}
+
+impl Bindgen for FunctionBindgen<'_> {
+    type Operand = String;
+
+    /// Get the sizes and alignment for a given structure
+    fn sizes(&self) -> &SizeAlign {
+        self.sizes
+    }
+
+    /// Push a new block of code
+    fn push_block(&mut self) {
+        let prev = mem::take(&mut self.src);
+        self.block_storage.push(prev);
+    }
+
+    /// Finish a block of code
+    fn finish_block(&mut self, operands: &mut Vec<String>) {
+        let to_restore = self.block_storage.pop().unwrap();
+        let src = mem::replace(&mut self.src, to_restore);
+        self.blocks.push((src.into(), mem::take(operands)));
+    }
+
+    /// Output the return pointer
+    fn return_pointer(&mut self, _size: ArchitectureSize, _align: Alignment) -> String {
+        unimplemented!("determining the return pointer for this function is not implemented");
+    }
+
+    /// Check whether a list of the given element type can be represented as a builtni JS type
+    ///
+    /// # Arguments
+    ///
+    /// * `resolve` - the [`Resolve`] that might be used to resolve nested types (i.e. [`Type::TypeId`])
+    /// * `elem_ty` - the [`Type`] of the element stored in the list
+    ///
+    fn is_list_canonical(&self, resolve: &Resolve, elem_ty: &Type) -> bool {
+        js_array_ty(resolve, elem_ty).is_some()
+    }
+
+    fn emit(
+        &mut self,
+        resolve: &Resolve,
+        inst: &Instruction<'_>,
+        operands: &mut Vec<String>,
+        results: &mut Vec<String>,
+    ) {
+        self.validate_task_management();
+        let task_managed = !self.skip_fn_call_task_management;
+        if !task_managed {
+            assert!(
+                !instruction_requires_task_runtime(inst),
+                "Async ABI instructions require task management"
+            );
+        }
+        match inst {
+            Instruction::GetArg { nth } => results.push(self.params[*nth].clone()),
+
+            Instruction::I32Const { val } => results.push(val.to_string()),
+
+            Instruction::ConstZero { tys } => {
+                for t in tys.iter() {
+                    match t {
+                        WasmType::I64 | WasmType::PointerOrI64 => results.push("0n".to_string()),
+                        WasmType::I32
+                        | WasmType::F32
+                        | WasmType::F64
+                        | WasmType::Pointer
+                        | WasmType::Length => results.push("0".to_string()),
+                    }
+                }
+            }
+
+            Instruction::U8FromI32 => self.clamp_guest(results, operands, u8::MIN, u8::MAX),
+
+            Instruction::S8FromI32 => self.clamp_guest(results, operands, i8::MIN, i8::MAX),
+
+            Instruction::U16FromI32 => self.clamp_guest(results, operands, u16::MIN, u16::MAX),
+
+            Instruction::S16FromI32 => self.clamp_guest(results, operands, i16::MIN, i16::MAX),
+
+            Instruction::U32FromI32 => results.push(format!("{} >>> 0", operands[0])),
+
+            Instruction::U64FromI64 => {
+                results.push(format!("BigInt.asUintN(64, BigInt({}))", operands[0]))
+            }
+
+            Instruction::S32FromI32 | Instruction::S64FromI64 => {
+                results.push(operands.pop().unwrap())
+            }
+
+            Instruction::I32FromU8 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToUint8));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::I32FromS8 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToInt8));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::I32FromU16 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToUint16));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::I32FromS16 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToInt16));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::I32FromU32 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToUint32));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::I32FromS32 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToInt32));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::I64FromU64 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToBigUint64));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::I64FromS64 => {
+                let conv = self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToBigInt64));
+                results.push(format!("{conv}({op})", op = operands[0]))
+            }
+
+            Instruction::F32FromCoreF32 | Instruction::F64FromCoreF64 => {
+                results.push(operands.pop().unwrap())
+            }
+
+            Instruction::CoreF32FromF32 | Instruction::CoreF64FromF64 => {
+                results.push(format!("+{}", operands[0]))
+            }
+
+            Instruction::CharFromI32 => {
+                let validate =
+                    self.intrinsic(Intrinsic::String(StringIntrinsic::ValidateGuestChar));
+                results.push(format!("{}({})", validate, operands[0]));
+            }
+
+            Instruction::I32FromChar => {
+                let validate = self.intrinsic(Intrinsic::String(StringIntrinsic::ValidateHostChar));
+                results.push(format!("{}({})", validate, operands[0]));
+            }
+
+            Instruction::Bitcasts { casts } => {
+                for (cast, op) in casts.iter().zip(operands) {
+                    results.push(self.bitcast(cast, op));
+                }
+            }
+
+            Instruction::BoolFromI32 => {
+                let tmp = self.tmp();
+                uwrite!(self.src, "var bool{} = {};\n", tmp, operands[0]);
+                if self.valid_lifting_optimization {
+                    results.push(format!("!!bool{tmp}"));
+                } else {
+                    let throw = self.intrinsic(Intrinsic::ThrowInvalidBool);
+                    results.push(format!(
+                        "bool{tmp} == 0 ? false : (bool{tmp} == 1 ? true : {throw}())"
+                    ));
+                }
+            }
+
+            Instruction::I32FromBool => {
+                results.push(format!("{} ? 1 : 0", operands[0]));
+            }
+
+            Instruction::RecordLower { record, .. } => {
+                // use destructuring field access to get each
+                // field individually.
+                let tmp = self.tmp();
+                let mut expr = "var {".to_string();
+                for (i, field) in record.fields.iter().enumerate() {
+                    if i > 0 {
+                        expr.push_str(", ");
+                    }
+                    let name = format!("v{tmp}_{i}");
+                    expr.push_str(&field.name.to_lower_camel_case());
+                    expr.push_str(": ");
+                    expr.push_str(&name);
+                    results.push(name);
+                }
+                uwrite!(self.src, "{} }} = {};\n", expr, operands[0]);
+            }
+
+            Instruction::RecordLift { record, .. } => {
+                // records are represented as plain objects, so we
+                // make a new object and set all the fields with an object
+                // literal.
+                let mut result = "{\n".to_string();
+                for (field, op) in record.fields.iter().zip(operands) {
+                    result.push_str(&format!("{}: {},\n", field.name.to_lower_camel_case(), op));
+                }
+                result.push('}');
+                results.push(result);
+            }
+
+            Instruction::TupleLower { tuple, .. } => {
+                // Tuples are represented as an array, sowe can use
+                // destructuring assignment to lower the tuple into its
+                // components.
+                let tmp = self.tmp();
+                let mut expr = "var [".to_string();
+                for i in 0..tuple.types.len() {
+                    if i > 0 {
+                        expr.push_str(", ");
+                    }
+                    let name = format!("tuple{tmp}_{i}");
+                    expr.push_str(&name);
+                    results.push(name);
+                }
+                uwrite!(self.src, "{}] = {};\n", expr, operands[0]);
+            }
+
+            Instruction::TupleLift { .. } => {
+                // Tuples are represented as an array, so we just shove all
+                // the operands into an array.
+                results.push(format!("[{}]", operands.join(", ")));
+            }
+
+            Instruction::FlagsLower { flags, .. } => {
+                let op0 = &operands[0];
+
+                if self.flags_as_bigint {
+                    let flag_count = flags.flags.len();
+                    uwriteln!(
+                        self.src,
+                        "if (typeof {op0} !== 'bigint') {{
+                            throw new TypeError('flags must be a bigint');
+                        }}
+                        if ({op0} < 0n || ({op0} >> {flag_count}n) !== 0n) {{
+                            throw new TypeError('flags have extraneous bits set');
+                        }}"
+                    );
+
+                    for i in 0..flags.repr().count() {
+                        let tmp = self.tmp();
+                        let name = format!("flags{tmp}");
+                        let shift = i * 32;
+                        uwriteln!(
+                            self.src,
+                            "const {name} = Number(({op0} >> {shift}n) & 0xffff_ffffn);"
+                        );
+                        results.push(name);
+                    }
+                    return;
+                }
+
+                // Generate the result names.
+                for _ in 0..flags.repr().count() {
+                    let tmp = self.tmp();
+                    let name = format!("flags{tmp}");
+                    // Default to 0 so that in the null/undefined case, everything is false by
+                    // default.
+                    uwrite!(self.src, "let {name} = 0;\n");
+                    results.push(name);
+                }
+
+                uwrite!(
+                    self.src,
+                    "if (typeof {op0} === 'object' && {op0} !== null) {{\n"
+                );
+
+                for (i, chunk) in flags.flags.chunks(32).enumerate() {
+                    let result_name = &results[i];
+
+                    uwrite!(self.src, "{result_name} = ");
+                    for (i, flag) in chunk.iter().enumerate() {
+                        if i != 0 {
+                            uwrite!(self.src, " | ");
+                        }
+
+                        let flag = flag.name.to_lower_camel_case();
+                        uwrite!(self.src, "Boolean({op0}.{flag}) << {i}");
+                    }
+                    uwrite!(self.src, ";\n");
+                }
+
+                uwrite!(
+                            self.src,
+                            "\
+                    }} else if ({op0} !== null && {op0} !== undefined) {{
+                        throw new TypeError('only an object, undefined or null can be converted to flags');
+                    }}
+                ");
+
+                // We don't need to do anything else for the null/undefined
+                // case, since that's interpreted as everything false, and we
+                // already defaulted everyting to 0.
+            }
+
+            Instruction::FlagsLift { flags, .. } => {
+                let tmp = self.tmp();
+                results.push(format!("flags{tmp}"));
+
+                if let Some(op) = operands.last() {
+                    // We only need an extraneous bits check if the number of flags isn't a multiple
+                    // of 32, because if it is then all the bits are used and there are no
+                    // extraneous bits.
+                    if flags.flags.len() % 32 != 0 && !self.valid_lifting_optimization {
+                        let mask: u32 = 0xffffffff << (flags.flags.len() % 32);
+                        uwriteln!(
+                            self.src,
+                            "if (({op} & {mask}) !== 0) {{
+                                throw new TypeError('flags have extraneous bits set');
+                            }}"
+                        );
+                    }
+                }
+
+                if self.flags_as_bigint {
+                    uwriteln!(self.src, "var flags{tmp} = 0n;");
+                    for (i, op) in operands.iter().enumerate() {
+                        let shift = i * 32;
+                        uwriteln!(self.src, "flags{tmp} |= BigInt({op} >>> 0) << {shift}n;");
+                    }
+                    return;
+                }
+
+                uwriteln!(self.src, "var flags{tmp} = {{");
+
+                for (i, flag) in flags.flags.iter().enumerate() {
+                    let flag = flag.name.to_lower_camel_case();
+                    let op = &operands[i / 32];
+                    let mask: u32 = 1 << (i % 32);
+                    uwriteln!(self.src, "{flag}: Boolean({op} & {mask}),");
+                }
+
+                uwriteln!(self.src, "}};");
+            }
+
+            Instruction::VariantPayloadName => results.push("e".to_string()),
+
+            Instruction::VariantLower {
+                variant,
+                results: result_types,
+                name,
+                ..
+            } => {
+                let blocks = self
+                    .blocks
+                    .drain(self.blocks.len() - variant.cases.len()..)
+                    .collect::<Vec<_>>();
+                let tmp = self.tmp();
+                let op = &operands[0];
+                uwriteln!(self.src, "var variant{tmp} = {op};");
+
+                for i in 0..result_types.len() {
+                    uwriteln!(self.src, "let variant{tmp}_{i};");
+                    results.push(format!("variant{tmp}_{i}"));
+                }
+
+                let expr_to_match = format!("variant{tmp}.tag");
+
+                uwriteln!(self.src, "switch ({expr_to_match}) {{");
+                for (case, (block, block_results)) in variant.cases.iter().zip(blocks) {
+                    uwriteln!(self.src, "case '{}': {{", case.name.as_str());
+                    if case.ty.is_some() {
+                        uwriteln!(self.src, "const e = variant{tmp}.val;");
+                    }
+                    self.src.push_str(&block);
+
+                    for (i, result) in block_results.iter().enumerate() {
+                        uwriteln!(self.src, "variant{tmp}_{i} = {result};");
+                    }
+                    uwriteln!(
+                        self.src,
+                        "break;
+                        }}"
+                    );
+                }
+                let variant_name = name.to_upper_camel_case();
+                uwriteln!(
+                    self.src,
+                    r#"default: {{
+                        throw new TypeError(`invalid variant tag value \`${{JSON.stringify({expr_to_match})}}\` (received \`${{variant{tmp}}}\`) specified for \`{variant_name}\``);
+                    }}"#,
+                );
+                uwriteln!(self.src, "}}");
+            }
+
+            Instruction::VariantLift { variant, name, .. } => {
+                let blocks = self
+                    .blocks
+                    .drain(self.blocks.len() - variant.cases.len()..)
+                    .collect::<Vec<_>>();
+
+                let tmp = self.tmp();
+                let op = &operands[0];
+
+                uwriteln!(
+                    self.src,
+                    "let variant{tmp};
+                    switch ({op}) {{"
+                );
+
+                for (i, (case, (block, block_results))) in
+                    variant.cases.iter().zip(blocks).enumerate()
+                {
+                    let tag = case.name.as_str();
+                    uwriteln!(
+                        self.src,
+                        "case {i}: {{
+                            {block}\
+                            variant{tmp} = {{
+                                tag: '{tag}',"
+                    );
+                    if case.ty.is_some() {
+                        assert!(block_results.len() == 1);
+                        uwriteln!(self.src, "   val: {}", block_results[0]);
+                    } else {
+                        assert!(block_results.is_empty());
+                    }
+                    uwriteln!(
+                        self.src,
+                        "   }};
+                        break;
+                        }}"
+                    );
+                }
+                let variant_name = name.to_upper_camel_case();
+                if !self.valid_lifting_optimization {
+                    uwriteln!(
+                        self.src,
+                        "default: {{
+                            throw new TypeError('invalid variant discriminant for {variant_name}');
+                        }}",
+                    );
+                }
+                uwriteln!(self.src, "}}");
+                results.push(format!("variant{tmp}"));
+            }
+
+            Instruction::OptionLower {
+                payload,
+                results: result_types,
+                ..
+            } => {
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                let (mut some, some_results) = self.blocks.pop().unwrap();
+                let (mut none, none_results) = self.blocks.pop().unwrap();
+
+                let tmp = self.tmp();
+                let op = &operands[0];
+                uwriteln!(self.src, "var variant{tmp} = {op};");
+
+                for i in 0..result_types.len() {
+                    uwriteln!(self.src, "let variant{tmp}_{i};");
+                    results.push(format!("variant{tmp}_{i}"));
+
+                    let some_result = &some_results[i];
+                    let none_result = &none_results[i];
+                    uwriteln!(some, "variant{tmp}_{i} = {some_result};");
+                    uwriteln!(none, "variant{tmp}_{i} = {none_result};");
+                }
+
+                if maybe_null(resolve, payload) {
+                    uwriteln!(
+                        self.src,
+                        r#"switch (variant{tmp}.tag) {{
+                            case 'none': {{
+                                {none}
+                                break;
+                            }}
+                            case 'some': {{
+                                const e = variant{tmp}.val;
+                                {some}
+                                break;
+                            }}
+                            default: {{
+                                {debug_log_fn}("ERROR: invalid value (expected option as object with 'tag' member)", {{ value: variant{tmp}, valueType: typeof variant{tmp} }});
+                                throw new TypeError('invalid variant specified for option');
+                            }}
+                        }}"#,
+                    );
+                } else {
+                    uwriteln!(
+                        self.src,
+                        "if (variant{tmp} === null || variant{tmp} === undefined) {{
+                            {none}\
+                        }} else {{
+                            const e = variant{tmp};
+                            {some}\
+                        }}"
+                    );
+                }
+            }
+
+            Instruction::OptionLift { payload, .. } => {
+                let (some, some_results) = self.blocks.pop().unwrap();
+                let (none, none_results) = self.blocks.pop().unwrap();
+                assert!(none_results.is_empty());
+                assert!(some_results.len() == 1);
+                let some_result = &some_results[0];
+
+                let tmp = self.tmp();
+                let op = &operands[0];
+
+                let (v_none, v_some) = if maybe_null(resolve, payload) {
+                    (
+                        "{ tag: 'none' }",
+                        format!(
+                            "{{
+                                tag: 'some',
+                                val: {some_result}
+                            }}"
+                        ),
+                    )
+                } else {
+                    ("undefined", some_result.into())
+                };
+
+                if !self.valid_lifting_optimization {
+                    uwriteln!(
+                        self.src,
+                        "let variant{tmp};
+                        switch ({op}) {{
+                            case 0: {{
+                                {none}\
+                                variant{tmp} = {v_none};
+                                break;
+                            }}
+                            case 1: {{
+                                {some}\
+                                variant{tmp} = {v_some};
+                                break;
+                            }}
+                            default: {{
+                                throw new TypeError('invalid variant discriminant for option');
+                            }}
+                        }}",
+                    );
+                } else {
+                    uwriteln!(
+                        self.src,
+                        "let variant{tmp};
+                        if ({op}) {{
+                            {some}\
+                            variant{tmp} = {v_some};
+                        }} else {{
+                            {none}\
+                            variant{tmp} = {v_none};
+                        }}"
+                    );
+                }
+
+                results.push(format!("variant{tmp}"));
+            }
+
+            Instruction::ResultLower {
+                results: result_types,
+                ..
+            } => {
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                let (mut err, err_results) = self.blocks.pop().unwrap();
+                let (mut ok, ok_results) = self.blocks.pop().unwrap();
+
+                let tmp = self.tmp();
+                let op = &operands[0];
+                uwriteln!(self.src, "var variant{tmp} = {op};");
+
+                for i in 0..result_types.len() {
+                    uwriteln!(self.src, "let variant{tmp}_{i};");
+                    results.push(format!("variant{tmp}_{i}"));
+
+                    let ok_result = &ok_results[i];
+                    let err_result = &err_results[i];
+                    uwriteln!(ok, "variant{tmp}_{i} = {ok_result};");
+                    uwriteln!(err, "variant{tmp}_{i} = {err_result};");
+                }
+
+                uwriteln!(
+                    self.src,
+                    r#"switch (variant{tmp}.tag) {{
+                        case 'ok': {{
+                            const e = variant{tmp}.val;
+                            {ok}
+                            break;
+                        }}
+                        case 'err': {{
+                            const e = variant{tmp}.val;
+                            {err}
+                            break;
+                        }}
+                        default: {{
+                            {debug_log_fn}("ERROR: invalid value (expected result as object with 'tag' member)", {{ value: variant{tmp}, valueType: typeof variant{tmp} }});
+                            throw new TypeError('invalid variant specified for result');
+                        }}
+                    }}"#,
+                );
+            }
+
+            Instruction::ResultLift { result, .. } => {
+                let (err, err_results) = self.blocks.pop().unwrap();
+                let (ok, ok_results) = self.blocks.pop().unwrap();
+                let ok_result = if result.ok.is_some() {
+                    assert_eq!(ok_results.len(), 1);
+                    ok_results[0].to_string()
+                } else {
+                    assert_eq!(ok_results.len(), 0);
+                    String::from("undefined")
+                };
+                let err_result = if result.err.is_some() {
+                    assert_eq!(err_results.len(), 1);
+                    err_results[0].to_string()
+                } else {
+                    assert_eq!(err_results.len(), 0);
+                    String::from("undefined")
+                };
+                let tmp = self.tmp();
+                let op0 = &operands[0];
+
+                if !self.valid_lifting_optimization {
+                    uwriteln!(
+                        self.src,
+                        "let variant{tmp};
+                        switch ({op0}) {{
+                            case 0: {{
+                                {ok}\
+                                variant{tmp} = {{
+                                    tag: 'ok',
+                                    val: {ok_result}
+                                }};
+                                break;
+                            }}
+                            case 1: {{
+                                {err}\
+                                variant{tmp} = {{
+                                    tag: 'err',
+                                    val: {err_result}
+                                }};
+                                break;
+                            }}
+                            default: {{
+                                throw new TypeError('invalid variant discriminant for expected');
+                            }}
+                        }}",
+                    );
+                } else {
+                    uwriteln!(
+                        self.src,
+                        "let variant{tmp};
+                        if ({op0}) {{
+                            {err}\
+                            variant{tmp} = {{
+                                tag: 'err',
+                                val: {err_result}
+                            }};
+                        }} else {{
+                            {ok}\
+                            variant{tmp} = {{
+                                tag: 'ok',
+                                val: {ok_result}
+                            }};
+                        }}"
+                    );
+                }
+                results.push(format!("variant{tmp}"));
+            }
+
+            Instruction::EnumLower { name, enum_, .. } => {
+                let tmp = self.tmp();
+
+                let op = &operands[0];
+                uwriteln!(self.src, "var val{tmp} = {op};");
+
+                // Declare a variable to hold the result.
+                uwriteln!(
+                    self.src,
+                    "let enum{tmp};
+                    switch (val{tmp}) {{"
+                );
+                for (i, case) in enum_.cases.iter().enumerate() {
+                    let case_name =
+                        crate::enum_case_name(&case.name, self.enum_values_screaming_snake_case);
+                    uwriteln!(
+                        self.src,
+                        "case '{case}': {{
+                            enum{tmp} = {i};
+                            break;
+                        }}",
+                        case = case_name
+                    );
+                }
+                uwriteln!(self.src, "default: {{");
+                if !self.valid_lifting_optimization {
+                    uwriteln!(
+                        self.src,
+                        "if (({op}) instanceof Error) {{
+                        console.error({op});
+                    }}"
+                    );
+                }
+                uwriteln!(
+                            self.src,
+                            "
+                            throw new TypeError(`\"${{val{tmp}}}\" is not one of the cases of {name}`);
+                        }}
+                    }}",
+                        );
+
+                results.push(format!("enum{tmp}"));
+            }
+
+            Instruction::EnumLift { name, enum_, .. } => {
+                let tmp = self.tmp();
+
+                uwriteln!(
+                    self.src,
+                    "let enum{tmp};
+                    switch ({}) {{",
+                    operands[0]
+                );
+                for (i, case) in enum_.cases.iter().enumerate() {
+                    let case_name =
+                        crate::enum_case_name(&case.name, self.enum_values_screaming_snake_case);
+                    uwriteln!(
+                        self.src,
+                        "case {i}: {{
+                            enum{tmp} = '{case}';
+                            break;
+                        }}",
+                        case = case_name
+                    );
+                }
+                if !self.valid_lifting_optimization {
+                    let name = name.to_upper_camel_case();
+                    uwriteln!(
+                        self.src,
+                        "default: {{
+                            throw new TypeError('invalid discriminant specified for {name}');
+                        }}",
+                    );
+                }
+                uwriteln!(self.src, "}}");
+
+                results.push(format!("enum{tmp}"));
+            }
+
+            // The ListCanonLower instruction is called on async function parameter lowers,
+            // which are separated in memory by one pointer follow.
+            //
+            // We ignore `realloc` in the instruction because it's the name of the *import* from the
+            // component's side (i.e. `"cabi_realloc"`). Bindings have already set up the appropriate
+            // realloc for the current component (e.g. `realloc0`) and it is available in the bindgen
+            // object @ `self.realloc`
+            //
+            // Note that this can be called *inside* a "regular" ListCanonLower, for example
+            // when a list of lists or list of Uint8Arrays is sent.
+            //
+            Instruction::ListCanonLower { element, .. } => {
+                self.intrinsic(Intrinsic::Conversion(
+                    ConversionIntrinsic::RequireValidNumericPrimitive,
+                ));
+                // FORK(js-guest-bindgen): memory is accessed through the `dataView` and
+                // `memoryWrite` helpers so an embedding can replace them
+                let data_view = self.intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::DataView));
+                let memory_write =
+                    self.intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::MemoryWrite));
+                let tmp = self.tmp();
+                let memory = self.memory.as_ref().unwrap();
+                let realloc = self.realloc.unwrap();
+
+                // Alias the list to a local variable
+                uwriteln!(self.src, "var val{tmp} = {};", operands[0]);
+                if matches!(element, Type::U8) {
+                    uwriteln!(
+                        self.src,
+                        "var len{tmp} = Array.isArray(val{tmp}) ? val{tmp}.length : val{tmp}.byteLength;"
+                    );
+                } else {
+                    uwriteln!(self.src, "var len{tmp} = val{tmp}.length;");
+                }
+
+                // Gather metadata about list element
+                let size = self.sizes.size(element).size_wasm32();
+                let align = self.sizes.align(element).align_wasm32();
+
+                // Allocate space for the type in question
+                uwriteln!(
+                    self.src,
+                    "var ptr{tmp} = {realloc_call}(0, 0, {align}, len{tmp} * {size});",
+                    realloc_call = if self.is_async {
+                        format!("await {realloc}")
+                    } else {
+                        realloc.to_string()
+                    },
+                );
+
+                // Determine what methods to use with a DataView when setting the data
+                let (dataview_set_method, check_fn_intrinsic) =
+                    gen_dataview_set_and_check_fn_js_for_numeric_type(resolve, element);
+
+                // Detect whether we're dealing with a regular array
+                uwriteln!(
+                    self.src,
+                    r#"
+                        let valData{tmp};
+                        const valLenBytes{tmp} = len{tmp} * {size};
+                        if (Array.isArray(val{tmp})) {{
+                            // Regular array likely containing numbers, write values to memory
+                            let offset = 0;
+                            const dv{tmp} = {data_view}({memory});
+                            for (const v of val{tmp}) {{
+                                {check_fn_intrinsic}(v);
+                                dv{tmp}.{dataview_set_method}(ptr{tmp} + offset, v, true);
+                                offset += {size};
+                            }}
+                        }} else {{
+                            // TypedArray / ArrayBuffer-like, direct copy
+                            valData{tmp} = new Uint8Array(val{tmp}.buffer || val{tmp}, val{tmp}.byteOffset, valLenBytes{tmp});
+                            {memory_write}({memory}, ptr{tmp}, valData{tmp});
+                        }}
+                    "#,
+                );
+
+                results.push(format!("ptr{tmp}"));
+                results.push(format!("len{tmp}"));
+            }
+
+            Instruction::ListCanonLift { element, .. } => {
+                // FORK(js-guest-bindgen): read through the `memoryView` helper
+                let memory_view =
+                    self.intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::MemoryView));
+                let tmp = self.tmp();
+                let memory = self.memory.as_ref().unwrap().to_string();
+                let size = self.sizes.size(element).size_wasm32();
+                let align = self.sizes.align(element).align_wasm32();
+                uwriteln!(self.src, "var ptr{tmp} = {} >>> 0;", operands[0]);
+                uwriteln!(self.src, "var len{tmp} = {};", operands[1]);
+                self.emit_list_bounds_check(&format!("ptr{tmp}"), &format!("len{tmp}"), size);
+                uwriteln!(
+                    self.src,
+                    "if (ptr{tmp} % {align} !== 0) throw new TypeError(`list pointer [${{ptr{tmp}}}] is not aligned to {align}`);
+                    var result{tmp} = {memory_view}({array_ty}, {memory}, ptr{tmp}, len{tmp}).slice();",
+                    array_ty = js_array_ty(resolve, element).unwrap(), // TODO: this is the wrong endianness
+                );
+                self.emit_dealloc(&format!("ptr{tmp}"), &format!("len{tmp}"), size, align);
+                results.push(format!("result{tmp}"));
+            }
+
+            Instruction::StringLower { .. } => {
+                // Only Utf8 and Utf16 supported for now
+                assert!(matches!(
+                    self.encoding,
+                    StringEncoding::UTF8 | StringEncoding::UTF16
+                ));
+
+                let (call_prefix, encode_intrinsic) = match (self.encoding, self.is_async) {
+                    (StringEncoding::UTF16, true) => (
+                        "await ",
+                        Intrinsic::String(StringIntrinsic::Utf16EncodeAsync),
+                    ),
+                    (StringEncoding::UTF16, false) => {
+                        ("", Intrinsic::String(StringIntrinsic::Utf16Encode))
+                    }
+                    (StringEncoding::UTF8, true) => (
+                        "await ",
+                        Intrinsic::String(StringIntrinsic::Utf8EncodeAsync),
+                    ),
+                    (StringEncoding::UTF8, false) => {
+                        ("", Intrinsic::String(StringIntrinsic::Utf8Encode))
+                    }
+                    _ => unreachable!("unsupported encoding {}", self.encoding),
+                };
+                let encode = self.intrinsic(encode_intrinsic);
+
+                let tmp = self.tmp();
+                let memory = self.memory.as_ref().unwrap();
+                let str = String::from("cabi_realloc");
+                let realloc = self.realloc.unwrap_or(&str);
+                let s = &operands[0];
+                uwriteln!(
+                    self.src,
+                    r#"
+                      var encodeRes = {call_prefix}{encode}({s}, {realloc}, {memory});
+                      var ptr{tmp} = encodeRes.ptr;
+                      var len{tmp} = {encoded_len};
+                    "#,
+                    encoded_len = match self.encoding {
+                        StringEncoding::UTF8 => "encodeRes.len".into(),
+                        _ => format!("{}.length", s),
+                    }
+                );
+                results.push(format!("ptr{tmp}"));
+                results.push(format!("len{tmp}"));
+            }
+
+            Instruction::StringLift => {
+                // Only Utf8 and Utf16 supported for now
+                assert!(matches!(
+                    self.encoding,
+                    StringEncoding::UTF8 | StringEncoding::UTF16
+                ));
+                let decoder = self.intrinsic(match self.encoding {
+                    StringEncoding::UTF16 => Intrinsic::String(StringIntrinsic::Utf16Decoder),
+                    _ => Intrinsic::String(StringIntrinsic::GlobalTextDecoderUtf8),
+                });
+                // FORK(js-guest-bindgen): read through the `memoryView` helper
+                let memory_view =
+                    self.intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::MemoryView));
+                let tmp = self.tmp();
+                let memory = self.memory.as_ref().unwrap();
+                uwriteln!(self.src, "var ptr{tmp} = {} >>> 0;", operands[0]);
+                uwriteln!(self.src, "var len{tmp} = {};", operands[1]);
+                uwriteln!(
+                    self.src,
+                    "var result{tmp} = {decoder}.decode({memory_view}(Uint{}Array, {memory}, ptr{tmp}, len{tmp}));",
+                    if self.encoding == StringEncoding::UTF16 {
+                        "16"
+                    } else {
+                        "8"
+                    }
+                );
+                let code_unit_size = if self.encoding == StringEncoding::UTF16 {
+                    2
+                } else {
+                    1
+                };
+                self.emit_dealloc(
+                    &format!("ptr{tmp}"),
+                    &format!("len{tmp}"),
+                    code_unit_size,
+                    code_unit_size,
+                );
+                results.push(format!("result{tmp}"));
+            }
+
+            Instruction::ListLower { element, .. } => {
+                let (body, body_results) = self.blocks.pop().unwrap();
+                assert!(body_results.is_empty());
+                let tmp = self.tmp();
+                let vec = format!("vec{tmp}");
+                let result = format!("result{tmp}");
+                let len = format!("len{tmp}");
+                let size = self.sizes.size(element).size_wasm32();
+                let align = ArchitectureSize::from(self.sizes.align(element)).size_wasm32();
+
+                // first store our vec-to-lower in a temporary since we'll
+                // reference it multiple times.
+                uwriteln!(self.src, "var {vec} = {};", operands[0]);
+                uwriteln!(self.src, "var {len} = {vec}.length;");
+
+                // ... then realloc space for the result in the guest module
+                let realloc = self.realloc.as_ref().unwrap();
+                uwriteln!(
+                    self.src,
+                    "var {result} = {realloc_call}(0, 0, {align}, {len} * {size});",
+                    realloc_call = if self.is_async {
+                        format!("await {realloc}")
+                    } else {
+                        realloc.to_string()
+                    },
+                );
+
+                // ... then consume the vector and use the block to lower the
+                // result.
+                self.emit_list_bounds_check(&result, &len, size);
+                uwriteln!(self.src, "for (let i = 0; i < {vec}.length; i++) {{");
+                uwriteln!(self.src, "const e = {vec}[i];");
+                uwrite!(self.src, "const base = {result} + i * {size};");
+                self.src.push_str(&body);
+                uwrite!(self.src, "}}\n");
+
+                results.push(result);
+                results.push(len);
+            }
+
+            Instruction::ListLift { element, .. } => {
+                let (body, body_results) = self.blocks.pop().unwrap();
+                let tmp = self.tmp();
+                let size = self.sizes.size(element).size_wasm32();
+                let align = self.sizes.align(element).align_wasm32();
+                let len = format!("len{tmp}");
+                uwriteln!(self.src, "var {len} = {};", operands[1]);
+                let base = format!("base{tmp}");
+                uwriteln!(self.src, "var {base} = {} >>> 0;", operands[0]);
+                self.emit_list_bounds_check(&base, &len, size);
+                uwriteln!(
+                    self.src,
+                    "if ({base} % {align} !== 0) throw new TypeError(`list pointer [${{{base}}}] is not aligned to {align}`);"
+                );
+                let result = format!("result{tmp}");
+                uwriteln!(self.src, "var {result} = [];");
+                results.push(result.clone());
+
+                uwriteln!(self.src, "for (let i = 0; i < {len}; i++) {{");
+                uwriteln!(self.src, "const base = {base} + i * {size};");
+                self.src.push_str(&body);
+                assert_eq!(body_results.len(), 1);
+                uwriteln!(self.src, "{result}.push({});", body_results[0]);
+                uwrite!(self.src, "}}\n");
+                self.emit_dealloc(&base, &len, size, align);
+            }
+
+            Instruction::MapLower { key, value, .. } => {
+                let (body, body_results) = self.blocks.pop().unwrap();
+                assert!(body_results.is_empty());
+
+                let tmp = self.tmp();
+                let map = format!("map{tmp}");
+                let entries = format!("entries{tmp}");
+                let result = format!("result{tmp}");
+                let len = format!("len{tmp}");
+                let entry = self.sizes.record([*key, *value]);
+                let size = entry.size.size_wasm32();
+                let align = ArchitectureSize::from(entry.align).size_wasm32();
+
+                uwriteln!(self.src, "const {map} = {};", operands[0]);
+                uwriteln!(
+                    self.src,
+                    "if (!({map} instanceof Map)) throw new TypeError('expected a Map');"
+                );
+                uwriteln!(self.src, "const {entries} = {map}.entries();");
+                uwriteln!(self.src, "const {len} = {map}.size;");
+
+                let realloc = self.realloc.as_ref().unwrap();
+                uwriteln!(
+                    self.src,
+                    "const {result} = {realloc_call}(0, 0, {align}, {len} * {size});",
+                    realloc_call = if self.is_async {
+                        format!("await {realloc}")
+                    } else {
+                        realloc.to_string()
+                    },
+                );
+
+                self.emit_list_bounds_check(&result, &len, size);
+                uwriteln!(self.src, "let i = 0;");
+                uwriteln!(self.src, "for (const [key, value] of {entries}) {{");
+                uwriteln!(self.src, "const base = {result} + i * {size};");
+                self.src.push_str(&body);
+                uwriteln!(self.src, "i++;");
+                uwrite!(self.src, "}}\n");
+
+                results.push(result);
+                results.push(len);
+            }
+
+            Instruction::MapLift { key, value, .. } => {
+                let (body, body_results) = self.blocks.pop().unwrap();
+                assert_eq!(body_results.len(), 2);
+
+                let tmp = self.tmp();
+                let entry = self.sizes.record([*key, *value]);
+                let entry_size = entry.size.size_wasm32();
+                let align = entry.align.align_wasm32();
+                let len = format!("len{tmp}");
+                uwriteln!(self.src, "const {len} = {};", operands[1]);
+                let base = format!("base{tmp}");
+                uwriteln!(self.src, "const {base} = {} >>> 0;", operands[0]);
+                self.emit_list_bounds_check(&base, &len, entry_size);
+                let result = format!("result{tmp}");
+                uwriteln!(self.src, "const {result} = new Map();");
+                results.push(result.clone());
+
+                uwriteln!(self.src, "for (let i = 0; i < {len}; i++) {{");
+                uwriteln!(self.src, "const base = {base} + i * {entry_size};");
+                self.src.push_str(&body);
+                uwriteln!(
+                    self.src,
+                    "{result}.set({}, {});",
+                    body_results[0],
+                    body_results[1]
+                );
+                uwrite!(self.src, "}}\n");
+                self.emit_dealloc(&base, &len, entry_size, align);
+            }
+
+            Instruction::FixedLengthListLower { size, .. } => {
+                let tmp = self.tmp();
+                let array = format!("array{tmp}");
+                uwriteln!(self.src, "const {array} = {};", operands[0]);
+                for i in 0..*size {
+                    results.push(format!("{array}[{i}]"));
+                }
+            }
+
+            Instruction::FixedLengthListLift { .. } => {
+                let tmp = self.tmp();
+                let result = format!("result{tmp}");
+                uwriteln!(self.src, "const {result} = [{}];", operands.join(", "));
+                results.push(result);
+            }
+
+            Instruction::FixedLengthListLowerToMemory {
+                element, size: len, ..
+            } => {
+                let (body, body_results) = self.blocks.pop().unwrap();
+                assert!(body_results.is_empty());
+
+                let tmp = self.tmp();
+                let array = format!("array{tmp}");
+                uwriteln!(self.src, "const {array} = {};", operands[0]);
+                let addr = format!("addr{tmp}");
+                uwriteln!(self.src, "const {addr} = {};", operands[1]);
+                let elem_size = self.sizes.size(element).size_wasm32();
+
+                uwriteln!(self.src, "for (let i = 0; i < {len}; i++) {{");
+                uwriteln!(self.src, "const e = {array}[i];");
+                uwrite!(self.src, "const base = {addr} + i * {elem_size};");
+                self.src.push_str(&body);
+                uwrite!(self.src, "}}\n");
+            }
+
+            Instruction::FixedLengthListLiftFromMemory {
+                element, size: len, ..
+            } => {
+                let (body, body_results) = self.blocks.pop().unwrap();
+                assert_eq!(body_results.len(), 1);
+
+                let tmp = self.tmp();
+                let addr = format!("addr{tmp}");
+                uwriteln!(self.src, "const {addr} = {};", operands[0]);
+                let elem_size = self.sizes.size(element).size_wasm32();
+                let result = format!("result{tmp}");
+                uwriteln!(self.src, "const {result} = [];");
+                results.push(result.clone());
+
+                uwriteln!(self.src, "for (let i = 0; i < {len}; i++) {{");
+                uwrite!(self.src, "const base = {addr} + i * {elem_size};");
+                self.src.push_str(&body);
+                uwriteln!(self.src, "{result}.push({});", body_results[0]);
+                uwrite!(self.src, "}}\n");
+            }
+
+            Instruction::IterElem { .. } => results.push("e".to_string()),
+
+            Instruction::IterMapKey { .. } => results.push("key".to_string()),
+
+            Instruction::IterMapValue { .. } => results.push("value".to_string()),
+
+            Instruction::IterBasePointer => results.push("base".to_string()),
+
+            Instruction::CallWasm { name, sig } => {
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                let get_component_state = self.task_intrinsic(Intrinsic::Component(
+                    ComponentIntrinsic::GetOrCreateAsyncState,
+                ));
+                let component_idx_expr = self
+                    .component_state
+                    .as_ref()
+                    .map(|state| state.get_js_exprs().component_idx)
+                    .unwrap_or_else(|| "-1".into());
+                let has_post_return = self.post_return.is_some();
+                let is_async = self.is_async;
+                uwriteln!(
+                    self.src,
+                    "{debug_log_fn}('{prefix} [Instruction::CallWasm] enter', {{
+                         funcName: '{name}',
+                         paramCount: {param_count},
+                         async: {is_async},
+                         postReturn: {has_post_return},
+                      }});",
+                    param_count = sig.params.len(),
+                    prefix = self.tracing_prefix,
+                );
+
+                // TODO: trap if this component is already on the call stack (re-entrancy)
+
+                // TODO(threads): start a thread
+                // TODO(threads): Task#enter needs to be called with the thread that is executing (inside thread_func)
+                // TODO(threads): thread_func will contain the actual call rather than attempting to execute immediately
+
+                // Output result binding preamble (e.g. 'var ret =', 'var [ ret0, ret1] = exports...() ')
+                // along with the code to perofrm the call
+                let sig_results_length = sig.results.len();
+                let (vars_init, assignment_lhs) =
+                    self.generate_result_assignment_lhs(sig_results_length, results, is_async);
+
+                let (call_prefix, call_err_cleanup) =
+                    if self.requires_async_porcelain | self.is_async {
+                        (
+                            "await ",
+                            format!(
+                                r#"
+                              {debug_log_fn}('[Instruction::CallWasm] error during async call', {{
+                                  taskID: task.id(),
+                                  err,
+                              }});
+                              {get_component_state}({component_idx_expr}).markTrapped(err);
+                              task.setErrored(err);
+                              task.reject(err);
+                              task.exit();
+                              return task.completionPromise();
+                            "#
+                            ),
+                        )
+                    } else {
+                        (
+                            "",
+                            format!(
+                                r#"
+                              {debug_log_fn}('[Instruction::CallWasm] error during sync call', {{
+                                  taskID: task.id(),
+                                  err,
+                              }});
+                              {get_component_state}({component_idx_expr}).markTrapped(err);
+                              task.setErrored(err);
+                              task.reject(err);
+                              task.exit();
+                              throw err;
+                            "#
+                            ),
+                        )
+                    };
+
+                let args = if self.asmjs {
+                    let split_i64 =
+                        self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::SplitBigInt64));
+
+                    let mut args = Vec::new();
+                    for (i, op) in operands
+                        .drain(operands.len() - sig.params.len()..)
+                        .enumerate()
+                    {
+                        if matches!(sig.params[i], WasmType::I64) {
+                            args.push(format!("...({split_i64}({op}))"));
+                        } else {
+                            args.push(op);
+                        }
+                    }
+                    args
+                } else {
+                    mem::take(operands)
+                };
+
+                let mut callee_invoke = format!(
+                    "{callee}({args})",
+                    callee = self.callee,
+                    args = args.join(", ")
+                );
+
+                if self.asmjs {
+                    // wasm2js does not support multivalue return
+                    // if/when it does, this will need changing.
+                    assert!(sig.results.len() <= 1);
+                    // same with async(?)
+                    assert!(!self.requires_async_porcelain && !self.is_async);
+
+                    if sig.results.len() == 1 && matches!(sig.results[0], WasmType::I64) {
+                        let merge_i64 = self
+                            .intrinsic(Intrinsic::Conversion(ConversionIntrinsic::MergeBigInt64));
+                        callee_invoke =
+                            format!("{merge_i64}({callee_invoke}, task.tmpRetI64HighBits)");
+                    }
+                }
+
+                // Argument lowering can await realloc and allow another task
+                // to run. Reinstall this task immediately before entering Wasm.
+                let call_wrapper = self.task_intrinsic(Intrinsic::WithGlobalCurrentTaskMetaFn);
+                if task_managed {
+                    uwriteln!(
+                        self.src,
+                        r#"
+                      {vars_init}
+                      try {{
+                           {assignment_lhs} {call_prefix}{call_wrapper}({{
+                               taskID: task.id(),
+                               componentIdx: task.componentIdx(),
+                               fn: () => {callee_invoke},
+                           }});
+                      }} catch (err) {{
+                          {call_err_cleanup}
+                      }}
+                      task.endFirstSlice();
+                    "#,
+                    );
+                } else {
+                    uwriteln!(
+                        self.src,
+                        "{vars_init}\n{assignment_lhs}{call_prefix}{callee_invoke};"
+                    );
+                }
+
+                // Core wasm32 pointers arrive as signed i32 values. Normalize
+                // them before any host-side arithmetic, which must not wrap.
+                for (result, ty) in results.iter_mut().zip(&sig.results) {
+                    if matches!(ty, WasmType::Pointer) {
+                        *result = format!("({result} >>> 0)");
+                    }
+                }
+
+                if self.tracing_enabled {
+                    let prefix = self.tracing_prefix;
+                    let to_result_string =
+                        self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToResultString));
+                    uwriteln!(
+                        self.src,
+                        "console.error(`{prefix} return {}`);",
+                        if sig_results_length > 0 || !results.is_empty() {
+                            format!("result=${{{to_result_string}(ret)}}")
+                        } else {
+                            "".to_string()
+                        }
+                    );
+                }
+            }
+
+            // Call to an imported interface (normally provided by the host)
+            Instruction::CallInterface { func, async_ } => {
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                let get_component_state = self.task_intrinsic(Intrinsic::Component(
+                    ComponentIntrinsic::GetOrCreateAsyncState,
+                ));
+                let track_host_operation = self
+                    .task_intrinsic(Intrinsic::Component(ComponentIntrinsic::TrackHostOperation));
+                let start_current_task_fn = self.task_intrinsic(Intrinsic::AsyncTask(
+                    AsyncTaskIntrinsic::CreateNewCurrentTask,
+                ));
+                let current_task_get_fn =
+                    self.task_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+
+                // At first, use the global current task metadata, in case we are executing from
+                // inside a with-global-current-task wrapper
+                let get_global_current_task_meta_fn =
+                    self.task_intrinsic(Intrinsic::GetGlobalCurrentTaskMetaFn);
+
+                uwriteln!(
+                    self.src,
+                    "{debug_log_fn}('{prefix} [Instruction::CallInterface] ({async_}, @ enter)');",
+                    prefix = self.tracing_prefix,
+                    async_ = async_.then_some("async").unwrap_or("sync"),
+                );
+
+                // Determine the callee function and arguments
+                let (callee_fn_js, callee_args_js) = if self.callee_resource_dynamic {
+                    (
+                        format!("{}.{}", operands[0], self.callee),
+                        operands[1..].join(", "),
+                    )
+                } else {
+                    (self.callee.into(), operands.join(", "))
+                };
+
+                if task_managed {
+                    uwriteln!(self.src, "const hostProvided = true;");
+                }
+
+                // Set task memory index and memory object
+                let (component_idx_expr, callback_fn_name_expr, get_callback_fn_expr) =
+                    if let Some(state) = &self.component_state {
+                        let ComponentStateJsExprs {
+                            component_idx,
+                            callback_fn_name,
+                            get_callback_fn,
+                            ..
+                        } = state.get_js_exprs();
+                        (component_idx, callback_fn_name, get_callback_fn)
+                    } else {
+                        ("-1".into(), "null".into(), "() => null".into())
+                    };
+
+                // Start the necessary subtasks and/or host task
+                //
+                // We must create a subtask in the case of an async host import.
+                //
+                // If there's no parent task, we're not executing in a subtask situation,
+                // so we can just create the new task and immediately continue execution.
+                //
+                // If there *is* a parent task, then we are likely about to create new task that
+                // matches/belongs to an existing subtask in the parent task.
+                //
+                // If we're dealing with a function that has been marked as a host import, then
+                // we expect that `Trampoline::LowerImport` and relevant intrinsics were called before
+                // this, and a subtask has been set up.
+                //
+                if task_managed {
+                    uwriteln!(
+                        self.src,
+                        r#"
+                    let parentTask;
+                    let task;
+                    let subtask;
+
+                    const createTask = () => {{
+                        const results = {start_current_task_fn}({{
+                            componentIdx: -1,
+                            isAsync: {is_async},
+                            entryFnName: '{fn_name}',
+                            getCallbackFn: {get_callback_fn_expr},
+                            callbackFnName: {callback_fn_name_expr},
+                            errHandling: '{err_handling}',
+                            callingWasmExport: false,
+                        }});
+                        task = results[0];
+                    }};
+
+                    taskCreation: {{
+                        parentTask = {current_task_get_fn}(
+                            {component_idx_expr},
+                            {get_global_current_task_meta_fn}({component_idx_expr})?.taskID,
+                        )?.task;
+
+                        if (!parentTask) {{
+                            createTask();
+                            break taskCreation;
+                        }}
+
+                        createTask();
+
+                        if (hostProvided) {{
+                            subtask = parentTask.getLatestSubtask();
+                            if (!subtask) {{
+                                throw new Error(`Missing subtask (in parent task [${{parentTask.id()}}]) for host import, has the import been lowered? (ensure asyncImports are set properly)`);
+                            }}
+                            task.setParentSubtask(subtask);
+                        }}
+                    }}
+                    "#,
+                        is_async = self.is_async,
+                        fn_name = self.callee,
+                        err_handling = self.err.to_js_string(),
+                    );
+                }
+
+                let is_async = self.requires_async_porcelain || *async_;
+
+                // If we're async then we *know* that there is a result, even if the functoin doesn't have one
+                // at the CM level -- async functions always return
+                let fn_wasm_result_count = if func.result.is_none() { 0 } else { 1 };
+
+                // If the task is async, do an explicit wait for backpressure before the call execution
+                if task_managed && is_async {
+                    uwriteln!(
+                        self.src,
+                        r#"
+                        const started = await task.enter({{ isHost: hostProvided }});
+                        if (!started) {{
+                            {debug_log_fn}('[Instruction::CallInterface] failed to enter task', {{
+                                taskID: task.id(),
+                                subtaskID: task.getParentSubtask()?.id(),
+                            }});
+                            // (the deadlock detector records why entry was given up on)
+                      throw task.isErrored() ?? new Error("failed to enter task");
+                        }}
+                        "#,
+                    );
+                } else if task_managed {
+                    uwriteln!(self.src, "const started = task.enterSync();",);
+                }
+
+                // Build the JS expression that calls the callee
+                let (call_prefix, call_wrapper, call_err_cleanup) = if is_async
+                    || self.requires_async_porcelain
+                {
+                    (
+                        "await ",
+                        self.task_intrinsic(Intrinsic::WithGlobalCurrentTaskMetaFnAsync),
+                        format!(
+                            r#"
+                              {debug_log_fn}('[Instruction::CallInterface] error during async call', {{
+                                  taskID: task.id(),
+                                  subtaskID: task.getParentSubtask()?.id(),
+                                  err,
+                              }});
+                              {get_component_state}({component_idx_expr}).markTrapped(err);
+                              task.setErrored(err);
+                              task.reject(err);
+                              task.exit();
+                              return task.completionPromise();
+                            "#
+                        ),
+                    )
+                } else {
+                    (
+                        "",
+                        self.task_intrinsic(Intrinsic::WithGlobalCurrentTaskMetaFn),
+                        format!(
+                            r#"
+                              {debug_log_fn}('[Instruction::CallInterface] error during sync call', {{
+                                  taskID: task.id(),
+                                  subtaskID: task.getParentSubtask()?.id(),
+                                  err,
+                              }});
+                              {get_component_state}({component_idx_expr}).markTrapped(err);
+                              task.setErrored(err);
+                              task.reject(err);
+                              task.exit();
+                              throw err;
+                            "#
+                        ),
+                    )
+                };
+
+                let call = if task_managed && is_async {
+                    // Hand the raw host return value to the subtask, so it can be disposed
+                    // if the guest cancels the call and discards the result
+                    format!(
+                        r#"{call_prefix} {call_wrapper}({{
+                              componentIdx: task.componentIdx(),
+                              taskID: task.id(),
+                              fn: () => {track_host_operation}(() => {{
+                                  const hostRet = {callee_fn_js}({callee_args_js});
+                                  subtask?.setHostPendingResult(hostRet);
+                                  return hostRet;
+                              }}),
+                          }})
+                        "#,
+                    )
+                } else if task_managed {
+                    format!(
+                        r#"{call_prefix} {call_wrapper}({{
+                              componentIdx: task.componentIdx(),
+                              taskID: task.id(),
+                              fn: () => {track_host_operation}(() => {callee_fn_js}({callee_args_js})),
+                          }})
+                        "#,
+                    )
+                } else {
+                    format!("{call_prefix}{callee_fn_js}({callee_args_js})")
+                };
+                let (vars_init, assignment_lhs) = if self.err == ErrHandling::ResultCatchHandler {
+                    results.push("ret".to_string());
+                    ("let ret;".to_string(), "ret = ".to_string())
+                } else {
+                    self.generate_result_assignment_lhs(fn_wasm_result_count, results, is_async)
+                };
+                uwriteln!(self.src, "{vars_init}");
+                let borrows = if !task_managed && self.clear_resource_borrows {
+                    let queue =
+                        self.intrinsic(Intrinsic::Resource(ResourceIntrinsic::CurResourceBorrows));
+                    let borrows = format!("borrows{}", self.tmp());
+                    uwriteln!(
+                        self.src,
+                        "const {borrows} = {queue};
+                        {queue} = [];
+                        try {{"
+                    );
+                    Some(borrows)
+                } else {
+                    None
+                };
+
+                match self.err {
+                    // If configured to do *no* error handling at all or throw
+                    // error objects directly, we can simply perform the call
+                    ErrHandling::None | ErrHandling::ThrowResultErr => {
+                        if task_managed {
+                            uwriteln!(
+                                self.src,
+                                r#"
+                              try {{
+                                 {assignment_lhs}{call};
+                              }} catch (err) {{
+                                  {call_err_cleanup}
+                              }}
+                            "#
+                            );
+                        } else {
+                            uwriteln!(self.src, "{assignment_lhs}{call};");
+                        }
+                    }
+                    // If configured to force all thrown errors into result objects,
+                    // then we add a try/catch around the call
+                    ErrHandling::ResultCatchHandler => {
+                        let (wrapped_ok, wrapped_err) = unambiguous_result_wrapper_tags(
+                            self.resolve,
+                            get_thrown_type(self.resolve, func.result).unwrap().0,
+                        );
+                        let host_ret = format!("hostRet{}", self.tmp());
+                        let wrapper_test = match (wrapped_ok, wrapped_err) {
+                            (true, true) => {
+                                format!("({host_ret}.tag === 'ok' || {host_ret}.tag === 'err')")
+                            }
+                            (true, false) => format!("{host_ret}.tag === 'ok'"),
+                            (false, true) => format!("{host_ret}.tag === 'err'"),
+                            (false, false) => "false".to_string(),
+                        };
+                        // result<_, string> allows JS error coercion only, while
+                        // any other result type will trap for arbitrary JS errors.
+                        let err_payload = if let (_, Some(Type::Id(err_ty))) =
+                            get_thrown_type(self.resolve, func.result).unwrap()
+                        {
+                            match &self.resolve.types[*err_ty].kind {
+                                TypeDefKind::Type(Type::String) => {
+                                    self.intrinsic(Intrinsic::GetErrorPayloadString)
+                                }
+                                _ => self.intrinsic(Intrinsic::GetErrorPayload),
+                            }
+                        } else {
+                            self.intrinsic(Intrinsic::GetErrorPayload)
+                        };
+                        let trap_check = task_managed.then(|| format!(
+                            "if ({get_component_state}({component_idx_expr}).markTrapped(e)) {{ throw e; }}"
+                        ));
+                        uwriteln!(
+                            self.src,
+                            r#"
+                            try {{
+                                const {host_ret} = {call};
+                                ret = {host_ret} !== null && typeof {host_ret} === 'object' && {wrapper_test}
+                                    ? {host_ret}
+                                    : {{ tag: 'ok', val: {host_ret} }};
+                            }} catch (e) {{
+                                {trap_check}
+                                ret = {{ tag: 'err', val: {err_payload}(e) }};
+                            }}
+                            "#,
+                            trap_check = trap_check.as_deref().unwrap_or_default(),
+                        );
+                    }
+                }
+
+                if self.tracing_enabled {
+                    let prefix = self.tracing_prefix;
+                    let to_result_string =
+                        self.intrinsic(Intrinsic::Conversion(ConversionIntrinsic::ToResultString));
+                    uwriteln!(
+                        self.src,
+                        "console.error(`{prefix} return {}`);",
+                        if fn_wasm_result_count > 0 || !results.is_empty() {
+                            format!("result=${{{to_result_string}(ret)}}")
+                        } else {
+                            "".to_string()
+                        }
+                    );
+                }
+
+                // TODO: if it was an async call, we may not be able to clear the borrows yet.
+                // save them to the task/ensure they are added to the task's list of borrows?
+                //
+                // TODO: if there is a subtask, we must not clear borrows until subtask.deliverReturn
+                // is called.
+
+                // After a high level call, we need to deactivate the component resource borrows.
+                if self.clear_resource_borrows {
+                    let symbol_resource_handle = self.intrinsic(Intrinsic::SymbolResourceHandle);
+                    let cur_resource_borrows = if let Some(borrows) = borrows {
+                        uwriteln!(self.src, "}} finally {{");
+                        borrows
+                    } else {
+                        self.intrinsic(Intrinsic::Resource(ResourceIntrinsic::CurResourceBorrows))
+                    };
+                    uwriteln!(
+                        self.src,
+                        "for (const entry of {cur_resource_borrows}) {{
+                            const rsc = entry.rsc ?? entry;
+                            if (entry.drop) {{
+                                if (rsc[{symbol_resource_handle}]) {{
+                                    entry.drop(rsc[{symbol_resource_handle}]);
+                                }}
+                            }}
+                            rsc[{symbol_resource_handle}] = undefined;
+                        }}"
+                    );
+                    if task_managed {
+                        uwriteln!(self.src, "{cur_resource_borrows} = [];");
+                    } else {
+                        uwriteln!(self.src, "}}");
+                    }
+                    self.clear_resource_borrows = false;
+                }
+            }
+
+            Instruction::Return {
+                func,
+                amt: stack_value_count,
+            } => {
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                uwriteln!(
+                    self.src,
+                    "{debug_log_fn}('{prefix} [Instruction::Return]', {{
+                         funcName: '{func_name}',
+                         paramCount: {stack_value_count},
+                         async: {is_async},
+                         postReturn: {post_return_present}
+                      }});",
+                    func_name = func.name,
+                    post_return_present = self.post_return.is_some(),
+                    is_async = self.is_async,
+                    prefix = self.tracing_prefix,
+                );
+
+                // Get the component idx expr
+                let component_idx_expr = if let Some(state) = &self.component_state {
+                    let ComponentStateJsExprs { component_idx, .. } = state.get_js_exprs();
+                    component_idx
+                } else {
+                    "-1".into()
+                };
+
+                // Build the post return functionality
+                // to clean up tasks and possibly return values
+                let get_or_create_async_state_fn = self.task_intrinsic(Intrinsic::Component(
+                    ComponentIntrinsic::GetOrCreateAsyncState,
+                ));
+                let gen_post_return_js =
+                    |(post_return_call, ret_stmt): (String, Option<String>)| {
+                        if !task_managed {
+                            return format!("{post_return_call}\n{}", ret_stmt.unwrap_or_default());
+                        }
+                        format!(
+                            r#"
+                        let cstate = {get_or_create_async_state_fn}({component_idx_expr});
+                        cstate.mayLeave = false;
+                        {post_return_call}
+                        cstate.mayLeave = true;
+                        task.exit();
+                        {ret_stmt}
+                            "#,
+                            ret_stmt = ret_stmt.unwrap_or_default(),
+                        )
+                    };
+
+                // Depending how many values are on the stack after returning, we must execute differently.
+                //
+                // In particular, if this function is async (distinct from whether async porcelain was necessary or not),
+                // rather than simply executing the function we must return (or block for) the promise that was created
+                // for the task.
+                match stack_value_count {
+                    // (sync) Handle no result case
+                    0 => {
+                        if task_managed {
+                            uwriteln!(self.src, "task.resolve([ret]);");
+                        }
+                        if let Some(f) = &self.post_return {
+                            uwriteln!(
+                                self.src,
+                                "{post_return_js}",
+                                post_return_js = gen_post_return_js((
+                                    format!("{}{f}();", if self.is_async { "await " } else { "" }),
+                                    None,
+                                )),
+                            );
+                        } else if task_managed {
+                            uwriteln!(self.src, "task.exit();");
+                        }
+                        if !task_managed {
+                            uwriteln!(self.src, "return;");
+                        }
+                    }
+
+                    // (sync) Handle single `result<t>` case
+                    1 if self.err == ErrHandling::ThrowResultErr => {
+                        let op = &operands[0];
+                        let throw_err = if self.no_component_error_wrapping {
+                            "throw retCopy.val;".to_string()
+                        } else {
+                            let component_err = self.intrinsic(Intrinsic::ComponentError);
+                            format!("throw new {component_err}(retCopy.val);")
+                        };
+
+                        uwriteln!(self.src, "const retCopy = {op};");
+                        if task_managed {
+                            uwriteln!(self.src, "task.resolve([retCopy.val]);");
+                        }
+
+                        if let Some(f) = &self.post_return {
+                            uwriteln!(
+                                self.src,
+                                "{}",
+                                gen_post_return_js((
+                                    format!(
+                                        "{}{f}(ret);",
+                                        if self.is_async { "await " } else { "" }
+                                    ),
+                                    None,
+                                ))
+                            );
+                        } else if task_managed {
+                            uwriteln!(self.src, "task.exit();");
+                        }
+
+                        uwriteln!(
+                            self.src,
+                            r#"
+                              if (typeof retCopy === 'object' && retCopy.tag === 'err') {{
+                                  {throw_err}
+                              }}
+                              return retCopy.val;
+                            "#
+                        );
+                    }
+
+                    // (sync) Handle all other cases (including single parameter non-result<t>)
+                    stack_value_count => {
+                        let ret_val = match stack_value_count {
+                            0 => unreachable!(
+                                "unexpectedly zero return values for synchronous return"
+                            ),
+                            1 => operands[0].to_string(),
+                            _ => format!("[{}]", operands.join(", ")),
+                        };
+                        // The surrounding FutureValue represents the future returned by the WIT
+                        // function, so the manual async transport must consume the lifted future
+                        // before boxing its payload for FutureValue's start operation.
+                        let return_val = if self.wrap_async_future_result {
+                            format!("{{ value: await {ret_val} }}")
+                        } else {
+                            ret_val.clone()
+                        };
+
+                        if task_managed {
+                            uwriteln!(self.src, "task.resolve([{ret_val}]);");
+                        }
+
+                        // Handle the post return if necessary
+                        if let Some(post_return_fn) = self.post_return {
+                            // In the case there is a post return function, we'll want to copy the value
+                            // then perform the post return before leaving
+
+                            // Write out the assignment for the given return value
+                            uwriteln!(self.src, "const retCopy = {ret_val};");
+                            let post_return_val = if self.wrap_async_future_result {
+                                "{ value: await retCopy }"
+                            } else {
+                                "retCopy"
+                            };
+
+                            // Generate the JS that should perform the post return w/ the result
+                            // and pass a copy fo the result to the actual caller
+                            let post_return_js = gen_post_return_js((
+                                format!(
+                                    "{}{post_return_fn}(ret);",
+                                    if self.is_async { "await " } else { "" }
+                                ),
+                                Some([format!("return {post_return_val};")].join("\n")),
+                            ));
+                            uwriteln!(self.src, "{post_return_js}");
+                        } else {
+                            if task_managed {
+                                uwriteln!(self.src, "task.exit();");
+                            }
+                            uwriteln!(self.src, "return {return_val};")
+                        }
+                    }
+                }
+            }
+
+            Instruction::I32Load { offset } => self.load("getInt32", *offset, operands, results),
+
+            Instruction::I64Load { offset } => self.load("getBigInt64", *offset, operands, results),
+
+            Instruction::F32Load { offset } => self.load("getFloat32", *offset, operands, results),
+
+            Instruction::F64Load { offset } => self.load("getFloat64", *offset, operands, results),
+
+            Instruction::I32Load8U { offset } => self.load("getUint8", *offset, operands, results),
+
+            Instruction::I32Load8S { offset } => self.load("getInt8", *offset, operands, results),
+
+            Instruction::I32Load16U { offset } => {
+                self.load("getUint16", *offset, operands, results)
+            }
+
+            Instruction::I32Load16S { offset } => self.load("getInt16", *offset, operands, results),
+
+            Instruction::I32Store { offset } => self.store("setInt32", *offset, operands),
+
+            Instruction::I64Store { offset } => self.store("setBigInt64", *offset, operands),
+
+            Instruction::F32Store { offset } => self.store("setFloat32", *offset, operands),
+
+            Instruction::F64Store { offset } => self.store("setFloat64", *offset, operands),
+
+            Instruction::I32Store8 { offset } => self.store("setInt8", *offset, operands),
+
+            Instruction::I32Store16 { offset } => self.store("setInt16", *offset, operands),
+
+            Instruction::LengthStore { offset } => self.store("setUint32", *offset, operands),
+
+            Instruction::LengthLoad { offset } => {
+                self.load("getUint32", *offset, operands, results)
+            }
+
+            Instruction::PointerStore { offset } => self.store("setUint32", *offset, operands),
+
+            Instruction::PointerLoad { offset } => {
+                self.load("getUint32", *offset, operands, results)
+            }
+
+            Instruction::Malloc { size, align, .. } => {
+                let tmp = self.tmp();
+                let realloc = self.realloc.as_ref().unwrap();
+                let ptr = format!("ptr{tmp}");
+                uwriteln!(
+                    self.src,
+                    "var {ptr} = {realloc_call}(0, 0, {align}, {size});",
+                    align = align.align_wasm32(),
+                    realloc_call = if self.is_async {
+                        format!("await {realloc}")
+                    } else {
+                        realloc.to_string()
+                    },
+                    size = size.size_wasm32()
+                );
+                results.push(ptr);
+            }
+
+            Instruction::HandleLift { handle, .. } => {
+                let (Handle::Own(ty) | Handle::Borrow(ty)) = handle;
+                let resource_ty = &crate::dealias(self.resolve, *ty);
+                let ResourceTable { imported, data } = &self.resource_map[resource_ty];
+
+                let is_own = matches!(handle, Handle::Own(_));
+                let rsc = format!("rsc{}", self.tmp());
+                let handle = format!("handle{}", self.tmp());
+                uwriteln!(self.src, "var {handle} = {};", &operands[0]);
+
+                match data {
+                    ResourceData::Host {
+                        tid,
+                        rid,
+                        component_idx,
+                        needs_task_context,
+                        local_name,
+                        dtor_name,
+                    } => {
+                        let tid = tid.as_u32();
+                        let rid = rid.as_u32();
+                        let symbol_dispose = self.intrinsic(Intrinsic::SymbolDispose);
+                        let rsc_table_remove = self
+                            .intrinsic(Intrinsic::Resource(ResourceIntrinsic::ResourceTableRemove));
+                        let rsc_flag = self
+                            .intrinsic(Intrinsic::Resource(ResourceIntrinsic::ResourceTableFlag));
+                        if !imported {
+                            let symbol_resource_handle =
+                                self.intrinsic(Intrinsic::SymbolResourceHandle);
+
+                            uwriteln!(
+                                self.src,
+                                "var {rsc} = new.target === {local_name} ? this : Object.create({local_name}.prototype);"
+                            );
+
+                            if is_own {
+                                // Sending an own handle out to JS as a return value - set up finalizer and disposal.
+                                let empty_func = self
+                                    .intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::EmptyFunc));
+                                uwriteln!(self.src,
+                                            "Object.defineProperty({rsc}, {symbol_resource_handle}, {{ writable: true, value: {handle} }});
+                                    finalizationRegistry{tid}.register({rsc}, {handle}, {rsc});");
+                                let component_idx = component_idx.as_u32();
+                                let dtor_call = dtor_name.as_ref().map(|dtor| {
+                                    if *needs_task_context {
+                                        let call_resource_destructor = self.intrinsic(
+                                            Intrinsic::Resource(ResourceIntrinsic::ResourceDestructorCall),
+                                        );
+                                        format!(
+                                            "{call_resource_destructor}({{ componentIdx: {component_idx}, dtor: {dtor}, rep: handleEntry.rep }});"
+                                        )
+                                    } else {
+                                        format!("{dtor}(handleEntry.rep);")
+                                    }
+                                }).unwrap_or_default();
+                                // Explicitly dropping an own handle must always release the host-side
+                                // handle and finalizer registration. A component-defined destructor is
+                                // an additional callback, not a prerequisite for resource cleanup.
+                                //
+                                // Disable Symbol.dispose and clear the handle before calling the
+                                // component destructor so repeated or re-entrant disposal is a no-op.
+                                uwriteln!(
+                                            self.src,
+                                            "Object.defineProperty({rsc}, {symbol_dispose}, {{ writable: true, value: function () {{
+                                        finalizationRegistry{tid}.unregister({rsc});
+                                        const handleEntry = {rsc_table_remove}(handleTable{tid}, {handle});
+                                        {rsc}[{symbol_dispose}] = {empty_func};
+                                        {rsc}[{symbol_resource_handle}] = undefined;
+                                        {dtor_call}
+                                    }}}});"
+                                        );
+                            } else {
+                                // Borrow handles of local resources have rep handles, which we carry through here.
+                                uwriteln!(
+                                    self.src,
+                                    "Object.defineProperty({rsc}, {symbol_resource_handle}, {{ writable: true, value: {handle} }});"
+                                );
+                            }
+                        } else {
+                            let rep = format!("rep{}", self.tmp());
+                            // Imported handles either lift as instance capture from a previous lowering,
+                            // or we create a new JS class to represent it.
+                            let symbol_resource_rep = self.intrinsic(Intrinsic::SymbolResourceRep);
+                            let symbol_resource_handle =
+                                self.intrinsic(Intrinsic::SymbolResourceHandle);
+
+                            uwriteln!(
+                                self.src,
+                                r#"
+                                  var {rep} = handleTable{tid}[({handle} << 1) + 1] & ~{rsc_flag};
+                                  var {rsc} = captureTable{rid}.get({rep});
+                                  if (!{rsc}) {{
+                                      {rsc} = Object.create({local_name}.prototype);
+                                      Object.defineProperty({rsc}, {symbol_resource_handle}, {{ writable: true, value: {handle} }});
+                                      Object.defineProperty({rsc}, {symbol_resource_rep}, {{ writable: true, value: {rep} }});
+                                  }}
+                                "#,
+                            );
+
+                            if is_own {
+                                // An own lifting is a transfer to JS, so existing own handle is implicitly dropped.
+                                uwriteln!(
+                                    self.src,
+                                    "else {{
+                                        captureTable{rid}.delete({rep});
+                                    }}
+                                    {rsc_table_remove}(handleTable{tid}, {handle});"
+                                );
+                            }
+                        }
+
+                        // Borrow handles are tracked to release after the call by CallInterface.
+                        if !is_own {
+                            let cur_resource_borrows = self.intrinsic(Intrinsic::Resource(
+                                ResourceIntrinsic::CurResourceBorrows,
+                            ));
+                            uwriteln!(self.src, "{cur_resource_borrows}.push({rsc});");
+                            self.clear_resource_borrows = true;
+                        }
+                    }
+
+                    ResourceData::Guest {
+                        resource_name,
+                        prefix,
+                        extra,
+                    } => {
+                        assert!(
+                            extra.is_none(),
+                            "plain resource handles do not carry extra data"
+                        );
+
+                        let symbol_resource_handle =
+                            self.intrinsic(Intrinsic::SymbolResourceHandle);
+                        let prefix = prefix.as_deref().unwrap_or("");
+                        let lower_camel = resource_name.to_lower_camel_case();
+
+                        if !imported {
+                            if is_own {
+                                uwriteln!(
+                                    self.src,
+                                    "var {rsc} = repTable.get($resource_{prefix}rep${lower_camel}({handle})).rep;"
+                                );
+                                uwrite!(
+                                    self.src,
+                                    r#"
+                                      repTable.delete({handle});
+                                      delete {rsc}[{symbol_resource_handle}];
+                                      finalizationRegistry_export${prefix}{lower_camel}.unregister({rsc});
+                                    "#
+                                );
+                            } else {
+                                uwriteln!(self.src, "var {rsc} = repTable.get({handle}).rep;");
+                            }
+                        } else {
+                            let upper_camel = resource_name.to_upper_camel_case();
+
+                            uwrite!(
+                                self.src,
+                                r#"
+                                  var {rsc} = new.target === import_{prefix}{upper_camel} ? this : Object.create(import_{prefix}{upper_camel}.prototype);
+                                   Object.defineProperty({rsc}, {symbol_resource_handle}, {{ writable: true, value: {handle} }});
+                                "#
+                            );
+
+                            uwriteln!(
+                                self.src,
+                                "finalizationRegistry_import${prefix}{lower_camel}.register({rsc}, {handle}, {rsc});",
+                            );
+
+                            if !is_own {
+                                let cur_resource_borrows = self.intrinsic(Intrinsic::Resource(
+                                    ResourceIntrinsic::CurResourceBorrows,
+                                ));
+                                uwriteln!(
+                                    self.src,
+                                    "{cur_resource_borrows}.push({{ rsc: {rsc}, drop: $resource_import${prefix}drop${lower_camel} }});"
+                                );
+                                self.clear_resource_borrows = true;
+                            }
+                        }
+                    }
+                }
+                results.push(rsc);
+            }
+
+            Instruction::HandleLower { handle, name, .. } => {
+                let (Handle::Own(ty) | Handle::Borrow(ty)) = handle;
+                let is_own = matches!(handle, Handle::Own(_));
+                let ResourceTable { imported, data } =
+                    &self.resource_map[&crate::dealias(self.resolve, *ty)];
+
+                let class_name = name.to_upper_camel_case();
+                let handle = format!("handle{}", self.tmp());
+                let symbol_resource_handle = self.intrinsic(Intrinsic::SymbolResourceHandle);
+                let symbol_dispose = self.intrinsic(Intrinsic::SymbolDispose);
+                let op = &operands[0];
+
+                match data {
+                    ResourceData::Host {
+                        tid,
+                        rid,
+                        local_name,
+                        ..
+                    } => {
+                        let tid = tid.as_u32();
+                        let rid = rid.as_u32();
+
+                        match (imported, is_own) {
+                            // Imported, owned host-provided resource
+                            (_imported @ false, _owned @ true) => {
+                                let empty_func = self
+                                    .intrinsic(Intrinsic::JsHelper(JsHelperIntrinsic::EmptyFunc));
+                                uwriteln!(
+                                    self.src,
+                                    r#"
+                                      var {handle} = {op}[{symbol_resource_handle}];
+                                      if (!{handle}) {{
+                                          throw new TypeError('Resource error: Not a valid \"{class_name}\" resource.');
+                                      }}
+                                      finalizationRegistry{tid}.unregister({op});
+                                      {op}[{symbol_dispose}] = {empty_func};
+                                      {op}[{symbol_resource_handle}] = undefined;
+                                    "#,
+                                );
+                            }
+
+                            // Imported, borrowed host-provdied resource
+                            (_imported @ false, _owned @ false) => {
+                                // When expecting a borrow, the JS resource provided will always be an own
+                                // handle. This is because it is not possible for borrow handles to be passed
+                                // back reentrantly.
+                                // We then set the handle to the rep per the local borrow rule.
+                                let rsc_flag = self.intrinsic(Intrinsic::Resource(
+                                    ResourceIntrinsic::ResourceTableFlag,
+                                ));
+                                let own_handle = format!("handle{}", self.tmp());
+                                uwriteln!(
+                                    self.src,
+                                    r#"
+                                      var {own_handle} = {op}[{symbol_resource_handle}];
+                                      if (!{own_handle} || (handleTable{tid}[({own_handle} << 1) + 1] & {rsc_flag}) === 0) {{
+                                          throw new TypeError('Resource error: Not a valid \"{class_name}\" resource.');
+                                      }}
+                                      var {handle} = handleTable{tid}[({own_handle} << 1) + 1] & ~{rsc_flag};
+                                    "#,
+                                );
+                            }
+
+                            // Imported, owned guest-provided resource
+                            (_imported @ true, _owned @ true) => {
+                                // Imported resources may already have a handle if they were constructed
+                                // by a component and then passed out.
+                                //
+                                // If the handle is not present, in hybrid bindgen we check for a Symbol.for('cabiRep')
+                                // to get the resource rep.
+                                //
+                                // Fall back to assign a new rep in the capture table, when the imported
+                                // resource was constructed externally.
+                                let symbol_resource_rep =
+                                    self.intrinsic(Intrinsic::SymbolResourceRep);
+                                let create_own_fn = self.intrinsic(Intrinsic::Resource(
+                                    ResourceIntrinsic::ResourceTableCreateOwn,
+                                ));
+
+                                uwriteln!(
+                                    self.src,
+                                    r#"
+                                      if (!({op} instanceof {local_name})) {{
+                                          throw new TypeError('Resource error: Not a valid \"{class_name}\" resource.');
+                                      }}
+                                      var {handle} = {op}[{symbol_resource_handle}];
+                                      if (!{handle}) {{
+                                          const rep = {op}[{symbol_resource_rep}] || ++captureCnt{rid};
+                                          captureTable{rid}.set(rep, {op});
+                                          {handle} = {create_own_fn}(handleTable{tid}, rep);
+                                      }}
+                                    "#
+                                );
+                            }
+
+                            // Imported, borrowed guest-provided resource
+                            (_imported @ true, _owned @ false) => {
+                                // Imported resources may already have a handle if they were constructed
+                                // by a component and then passed out.
+                                //
+                                // Otherwise, in hybrid bindgen we check for a Symbol.for('cabiRep')
+                                // to get the resource rep.
+                                // Fall back to assign a new rep in the capture table, when the imported
+                                // resource was constructed externally.
+
+                                let symbol_resource_rep =
+                                    self.intrinsic(Intrinsic::SymbolResourceRep);
+                                let scope_id = self.intrinsic(Intrinsic::ScopeId);
+                                let create_borrow_fn = self.intrinsic(Intrinsic::Resource(
+                                    ResourceIntrinsic::ResourceTableCreateBorrow,
+                                ));
+
+                                uwriteln!(
+                                    self.src,
+                                    r#"
+                                      if (!({op} instanceof {local_name})) {{
+                                          throw new TypeError('Resource error: Not a valid \"{class_name}\" resource.');
+                                      }}
+                                      var {handle} = {op}[{symbol_resource_handle}];
+                                      if (!{handle}) {{
+                                          const rep = {op}[{symbol_resource_rep}] || ++captureCnt{rid};
+                                          captureTable{rid}.set(rep, {op});
+                                          {handle} = {create_borrow_fn}(handleTable{tid}, rep, {scope_id});
+                                      }}
+                                    "#
+                                );
+                            }
+                        }
+                    }
+
+                    ResourceData::Guest {
+                        resource_name,
+                        prefix,
+                        extra,
+                    } => {
+                        assert!(
+                            extra.is_none(),
+                            "plain resource handles do not carry extra data"
+                        );
+
+                        let upper_camel = resource_name.to_upper_camel_case();
+                        let lower_camel = resource_name.to_lower_camel_case();
+                        let prefix = prefix.as_deref().unwrap_or("");
+
+                        let symbol_resource_handle =
+                            self.intrinsic(Intrinsic::SymbolResourceHandle);
+
+                        let tmp = self.tmp();
+                        match (imported, is_own) {
+                            // imported owned/borrowed guest resource
+                            (_imported @ true, _owned) => {
+                                uwrite!(
+                                    self.src,
+                                    r#"
+                                      var {handle} = {op}[{symbol_resource_handle}];
+                                      finalizationRegistry_import${prefix}{lower_camel}.unregister({op});
+                                    "#
+                                );
+                            }
+
+                            // Not-imported, borrowed guest resource
+                            (_imported @ false, _owned @ false) => {
+                                let local_rep = format!("localRep{tmp}");
+                                uwriteln!(
+                                    self.src,
+                                    r#"
+                                      if (!({op} instanceof {upper_camel})) {{
+                                          throw new TypeError('Resource error: Not a valid \"{upper_camel}\" resource.');
+                                      }}
+                                      let {handle} = {op}[{symbol_resource_handle}];
+                                      if ({handle} === undefined) {{
+                                          var {local_rep} = repCnt++;
+                                          repTable.set({local_rep}, {{ rep: {op}, own: false }});
+                                          {op}[{symbol_resource_handle}] = {local_rep};
+                                      }}
+                                    "#
+                                );
+                            }
+
+                            // Not-imported, owned guest resource
+                            (_imported @ false, _owned @ true) => {
+                                let local_rep = format!("localRep{tmp}");
+                                uwriteln!(
+                                    self.src,
+                                    r#"
+                                      if (!({op} instanceof {upper_camel})) {{
+                                          throw new TypeError('Resource error: Not a valid \"{upper_camel}\" resource.');
+                                      }}
+                                      let {handle} = {op}[{symbol_resource_handle}];
+                                      if ({handle} === undefined) {{
+                                          var {local_rep} = repCnt++;
+                                          repTable.set({local_rep}, {{ rep: {op}, own: true }});
+                                          {handle} = $resource_{prefix}new${lower_camel}({local_rep});
+                                          {op}[{symbol_resource_handle}] = {handle};
+                                          finalizationRegistry_export${prefix}{lower_camel}.register({op}, {handle}, {op});
+                                      }}
+                                    "#
+                                );
+                            }
+                        }
+                    }
+                }
+                results.push(handle);
+            }
+
+            Instruction::DropHandle { ty } => {
+                let _ = ty;
+                todo!("[Instruction::DropHandle] not yet implemented")
+            }
+
+            Instruction::Flush { amt } => {
+                for item in operands.iter().take(*amt) {
+                    results.push(item.clone());
+                }
+            }
+
+            Instruction::ErrorContextLift => {
+                let item = operands
+                    .first()
+                    .expect("unexpectedly missing ErrorContextLift arg");
+                results.push(item.clone());
+            }
+
+            Instruction::ErrorContextLower => {
+                let item = operands
+                    .first()
+                    .expect("unexpectedly missing ErrorContextLower arg");
+                results.push(item.clone());
+            }
+
+            Instruction::FutureLower { ty, .. } => {
+                let future_arg = operands
+                    .first()
+                    .expect("unexpectedly missing FutureLower arg");
+
+                // Lowering is only performed inline for sync functions, and for async
+                // functions when the operand is an incoming parameter (e.g. an async
+                // export lowering a host-provided `Promise` param before `CallWasm`).
+                //
+                // For async host *imports* the operand is the host function's return
+                // value (i.e. produced by `CallInterface`): lowering of async import
+                // results is performed by the async return-handling machinery
+                // (see `AsyncTaskIntrinsic::LowerImport` and `task.resolve`), so
+                // lowering the value inline here as well would consume/settle the
+                // `Promise` and double-lower it.
+                if self.is_async && self.for_import.unwrap_or_default() {
+                    results.push(future_arg.clone());
+                    return;
+                }
+
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                let get_or_create_async_state_fn = self.intrinsic(Intrinsic::Component(
+                    ComponentIntrinsic::GetOrCreateAsyncState,
+                ));
+                let gen_future_host_inject_fn = self.intrinsic(Intrinsic::AsyncFuture(
+                    AsyncFutureIntrinsic::GenFutureHostInjectFn,
+                ));
+                let is_future_lowerable_object_fn = self.intrinsic(Intrinsic::AsyncFuture(
+                    AsyncFutureIntrinsic::IsFutureLowerableObject,
+                ));
+                let nested_future_symbol = self.intrinsic(Intrinsic::AsyncFuture(
+                    AsyncFutureIntrinsic::NestedFutureSymbol,
+                ));
+                let create_future_fn =
+                    self.intrinsic(Intrinsic::AsyncFuture(AsyncFutureIntrinsic::CreateFuture));
+
+                // Build the lowering function for the type produced by the future
+                let type_id = &crate::dealias(self.resolve, *ty);
+                let ResourceTable {
+                    imported: true,
+                    data:
+                        ResourceData::Guest {
+                            extra:
+                                Some(ResourceExtraData::Future {
+                                    table_idx: future_table_idx_ty,
+                                    nesting_level,
+                                    elem_ty,
+                                }),
+                            ..
+                        },
+                } = self
+                    .resource_map
+                    .get(type_id)
+                    .expect("missing resource mapping for future lower")
+                else {
+                    unreachable!("invalid resource table observed during future lower");
+                };
+                let future_table_idx = future_table_idx_ty.as_u32();
+
+                // Generate payload metadata ('elemMeta')
+                let (
+                    payload_type_name_js,
+                    lift_fn_js,
+                    lower_fn_js,
+                    payload_is_none,
+                    payload_is_numeric,
+                    payload_is_borrow,
+                    payload_is_async_value,
+                    payload_size32_js,
+                    payload_align32_js,
+                    payload_flat_count_js,
+                ) = match elem_ty {
+                    Some(PayloadTypeMetadata {
+                        ty: _,
+                        iface_ty,
+                        lift_js_expr,
+                        lower_js_expr,
+                        size32,
+                        align32,
+                        flat_count,
+                    }) => (
+                        format!("'{iface_ty:?}'"),
+                        lift_js_expr.as_str(),
+                        lower_js_expr.as_str(),
+                        "false",
+                        format!(
+                            "{}",
+                            matches!(
+                                iface_ty,
+                                InterfaceType::U8
+                                    | InterfaceType::U16
+                                    | InterfaceType::U32
+                                    | InterfaceType::U64
+                                    | InterfaceType::S8
+                                    | InterfaceType::S16
+                                    | InterfaceType::S32
+                                    | InterfaceType::S64
+                                    | InterfaceType::Float32
+                                    | InterfaceType::Float64
+                            )
+                        ),
+                        format!("{}", matches!(iface_ty, InterfaceType::Borrow(_))),
+                        format!(
+                            "{}",
+                            matches!(
+                                iface_ty,
+                                InterfaceType::Stream(_) | InterfaceType::Future(_)
+                            )
+                        ),
+                        size32.to_string(),
+                        align32.to_string(),
+                        flat_count.unwrap_or(0).to_string(),
+                    ),
+                    None => (
+                        "null".into(),
+                        "() => {{ throw new Error('no lift fn'); }}",
+                        "() => {{ throw new Error('no lower fn'); }}",
+                        "true",
+                        "false".into(),
+                        "false".into(),
+                        "false".into(),
+                        "null".into(),
+                        "null".into(),
+                        "0".into(),
+                    ),
+                };
+
+                let tmp = self.tmp();
+                let lowered_future_waitable_idx = format!("futureWaitableIdx{tmp}");
+
+                let (component_idx_expr, get_realloc_fn_expr) =
+                    if let Some(state) = &self.component_state {
+                        let ComponentStateJsExprs {
+                            component_idx,
+                            get_realloc_fn,
+                            ..
+                        } = state.get_js_exprs();
+                        (component_idx, get_realloc_fn)
+                    } else {
+                        ("-1".into(), "undefined".into())
+                    };
+
+                uwriteln!(
+                    self.src,
+                    r#"
+                        if (!{is_future_lowerable_object_fn}({future_arg})) {{
+                            {debug_log_fn}('[Instruction::FutureLower] object is not a Promise/Thenable', {{ {future_arg} }});
+                            throw new Error('unrecognized future object (not Promise/Thenable)');
+                        }}
+
+                        const cstate{tmp} = {get_or_create_async_state_fn}({component_idx_expr});
+                        if (!cstate{tmp}) {{
+                            throw new Error(`missing component state for component [{component_idx_expr}]`);
+                        }}
+
+                        // TODO(feat): facilitate non utf8 string encoding for lowered futures
+                        const stringEncoding{tmp} = 'utf8';
+
+                        let outermostReadEnd{tmp};
+                        let futuresList{tmp} = [];
+                        let future{tmp} = {future_arg};
+                        let nextFuture{tmp};
+                        let openedCount{tmp} = -1;
+                        // Lower exactly this future layer. If its payload is another
+                        // future, elemMeta.lowerFn recursively creates that endpoint.
+                        let futureNestingLevel{tmp} = 0;
+
+                        while (futureNestingLevel{tmp} >= 0) {{
+                            const {{
+                                writeEnd,
+                                writeEndWaitableIdx,
+                                readEnd,
+                                readEndWaitableIdx
+                            }} = {create_future_fn}(cstate{tmp}, {{
+                                tableIdx: {future_table_idx},
+                                elemMeta: {{
+                                    liftFn: {lift_fn_js},
+                                    lowerFn: {lower_fn_js},
+                                    payloadTypeName: {payload_type_name_js},
+                                    isNone: {payload_is_none},
+                                    isNumeric: {payload_is_numeric},
+                                    isBorrowed: {payload_is_borrow},
+                                    isAsyncValue: {payload_is_async_value},
+                                    flatCount: {payload_flat_count_js},
+                                    align32: {payload_align32_js},
+                                    size32: {payload_size32_js},
+                                    stringEncoding: stringEncoding{tmp},
+                                    getReallocFn: {get_realloc_fn_expr},
+                                }}
+                            }});
+
+                            const hostInjectFn{tmp} = {gen_future_host_inject_fn}({{
+                                promise: future{tmp},
+                                stringEncoding: stringEncoding{tmp},
+                                hostWriteEnd: writeEnd,
+                            }});
+                            readEnd.setHostInjectFn(hostInjectFn{tmp});
+
+                            const meta{tmp} = {{
+                                isInnermost: futureNestingLevel{tmp} === {nesting_level},
+                                level: futureNestingLevel{tmp},
+                            }};
+
+                            const innerFuture = future{tmp};
+                            future{tmp} = {{ }};
+                            future{tmp}[{nested_future_symbol}] = meta{tmp};
+                            future{tmp}.readEndWaitableIdx = readEndWaitableIdx;
+                            future{tmp}.writeEndWaitableIdx = writeEndWaitableIdx;
+                            future{tmp}.futureTableIdx = {future_table_idx};
+                            future{tmp}.componentIdx = {component_idx_expr};
+                            future{tmp}.then = async (resolve, reject) => {{
+                                let p;
+                                if (openedCount{tmp} === {nesting_level}) {{
+                                    p = innerFuture;
+                                }} else {{
+                                    openedCount{tmp}++;
+                                    p = futuresList{tmp}[futuresList{tmp}.length - (openedCount{tmp} + 1)];
+                                }}
+
+                                try {{
+                                    resolve(await p);
+                                }} catch (err) {{
+                                    reject(err);
+                                }}
+                            }};
+
+                            outermostReadEnd{tmp} = readEnd;
+
+                            futuresList{tmp}.push(future{tmp});
+                            futureNestingLevel{tmp}--;
+                        }}
+
+                        const readEnd{tmp} = outermostReadEnd{tmp};
+
+                        // TODO: need to *lower* the internal future???
+
+                        const {lowered_future_waitable_idx} = readEnd{tmp}.waitableIdx();
+                    "#
+                );
+
+                results.push(lowered_future_waitable_idx);
+            }
+
+            Instruction::FutureLift { payload, ty } => {
+                let future_new_from_lift_fn = self.intrinsic(Intrinsic::AsyncFuture(
+                    AsyncFutureIntrinsic::FutureNewFromLift,
+                ));
+
+                // We must look up the type idx to find the future
+                let type_id = &crate::dealias(self.resolve, *ty);
+                let ResourceTable {
+                    imported: true,
+                    data:
+                        ResourceData::Guest {
+                            extra:
+                                Some(ResourceExtraData::Future {
+                                    table_idx: future_table_idx_ty,
+                                    elem_ty: future_element_ty,
+                                    ..
+                                }),
+                            ..
+                        },
+                } = self
+                    .resource_map
+                    .get(type_id)
+                    .expect("missing resource mapping for future lift")
+                else {
+                    unreachable!("invalid resource table observed during future lift");
+                };
+
+                // if a future element is present, it should match the payload we're getting
+                let (lift_fn_js, lower_fn_js) = match future_element_ty {
+                    Some(PayloadTypeMetadata {
+                        ty,
+                        lift_js_expr,
+                        lower_js_expr,
+                        ..
+                    }) => {
+                        assert_eq!(Some(*ty), **payload, "future element type mismatch");
+                        (lift_js_expr.to_string(), lower_js_expr.to_string())
+                    }
+                    None => (
+                        "() => {{ throw new Error('no lift fn'); }}".into(),
+                        "() => {{ throw new Error('no lower fn'); }}".into(),
+                    ),
+                };
+                if let Some(PayloadTypeMetadata { ty, .. }) = future_element_ty {
+                    assert_eq!(Some(*ty), **payload, "future element type mismatch");
+                }
+
+                let tmp = self.tmp();
+                let result_var = format!("futureResult{tmp}");
+
+                // Optionally preform the lift for the future in question
+                match (
+                    self.canonical_abi_async,
+                    self.for_import.unwrap_or_default(),
+                ) {
+                    // It is possible for lifting to be called both at the *start* and *end* of
+                    // a given function depending on how it called:
+                    //
+                    // 1. lifting results to convert a component-produced result for use by the host *after* `CallWasm` returns
+                    // 2. lifting parameters (`future` -> `Promise`), for use by the host, *before* `CallInterface`
+                    //
+                    // In (1), the function being generated must correspond to an export (from a component), and we only
+                    // perform the lifting if we know the value is imminently ready (i.e. the sync case).
+                    //
+                    // In (2) the function must correspond to an import (from the host), and regardless of whether
+                    // the function being generated is async or not, the host *must* deal in terms of lifted values
+                    // (i.e. `Promise`, not index to a future)
+                    //
+                    (_is_async @ false, _for_import @ false) | (_is_async, _for_import @ true) => {
+                        // If we're dealing with a sync function, we can use the return directly
+                        let arg_future_end_idx = operands
+                            .first()
+                            .expect("unexpectedly missing future end return arg in FutureLift");
+
+                        let (payload_ty_size32_js, payload_ty_align32_js) =
+                            if let Some(payload_ty) = payload {
+                                (
+                                    self.sizes.size(payload_ty).size_wasm32().to_string(),
+                                    self.sizes.align(payload_ty).align_wasm32().to_string(),
+                                )
+                            } else {
+                                ("null".into(), "null".into())
+                            };
+
+                        let future_table_idx = future_table_idx_ty.as_u32();
+
+                        // Set task memory index and memory object
+                        let component_idx_expr = if let Some(state) = &self.component_state {
+                            let ComponentStateJsExprs { component_idx, .. } = state.get_js_exprs();
+                            component_idx
+                        } else {
+                            "-1".into()
+                        };
+
+                        // We only need to write the result var for use *if* the
+                        // function that is being executed is provided by the host (i.e. `CallInterface`)
+                        //
+                        // The future value in question is being lifted *from* the component,
+                        // such that the host call can use it (as a `Promise`).
+                        //
+                        // `hostProvided` is set hoistably in `CallWasm`/`CallInterface`
+                        uwriteln!(
+                            self.src,
+                            r#"
+                              const {result_var} = {future_new_from_lift_fn}({{
+                                  componentIdx: {component_idx_expr},
+                                  futureTableIdx: {future_table_idx},
+                                  futureEndWaitableIdx: {arg_future_end_idx},
+                                  payloadLiftFn: {lift_fn_js},
+                                  payloadLowerFn: {lower_fn_js},
+                                  payloadTypeSize32: {payload_ty_size32_js},
+                                  payloadTypeAlign32: {payload_ty_align32_js},
+                              }});
+                            "#,
+                        );
+                    }
+
+                    // For all other cases, we do not need to perform the lift
+                    _ => {}
+                }
+
+                results.push(result_var.clone());
+            }
+
+            Instruction::StreamLower { ty, .. } => {
+                let stream_arg = operands
+                    .first()
+                    .expect("unexpectedly missing StreamLower arg");
+
+                // Lowering is only performed inline for sync functions, and for async
+                // functions when the operand is an incoming parameter (e.g. an async
+                // export lowering a host-provided stream param before `CallWasm`).
+                //
+                // For async host *imports* the operand is the host function's return
+                // value (i.e. produced by `CallInterface`): lowering of async import
+                // results is performed by the async return-handling machinery
+                // (see `AsyncTaskIntrinsic::LowerImport` and `task.resolve`), so
+                // lowering the value inline here as well would consume/lock the
+                // stream (e.g. a host `ReadableStream`) and double-lower it.
+                if self.is_async && self.for_import.unwrap_or_default() {
+                    results.push(stream_arg.clone());
+                    return;
+                }
+
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                let async_iterator_symbol = self.intrinsic(Intrinsic::SymbolAsyncIterator);
+                let iterator_symbol = self.intrinsic(Intrinsic::SymbolIterator);
+                let external_readable_stream_class =
+                    self.intrinsic(Intrinsic::PlatformReadableStreamClass);
+                let get_or_create_async_state_fn = self.intrinsic(Intrinsic::Component(
+                    ComponentIntrinsic::GetOrCreateAsyncState,
+                ));
+                let gen_stream_host_inject_fn = self.intrinsic(Intrinsic::AsyncStream(
+                    AsyncStreamIntrinsic::GenStreamHostInjectFn,
+                ));
+                let gen_read_fn_from_lowerable_stream_fn = self.intrinsic(Intrinsic::AsyncStream(
+                    AsyncStreamIntrinsic::GenReadFnFromLowerableStream,
+                ));
+                let create_stream_fn =
+                    self.intrinsic(Intrinsic::AsyncStream(AsyncStreamIntrinsic::CreateStream));
+
+                // TODO(???): A component could end up receiving a stream that it outputted,
+                // and the below would fail (imported: false)?
+
+                // Build the lowering function for the type produced by the stream
+                let type_id = &crate::dealias(self.resolve, *ty);
+                let ResourceTable {
+                    imported: true,
+                    data:
+                        ResourceData::Guest {
+                            extra:
+                                Some(ResourceExtraData::Stream {
+                                    table_idx: stream_table_idx_ty,
+                                    elem_ty,
+                                }),
+                            ..
+                        },
+                } = self
+                    .resource_map
+                    .get(type_id)
+                    .expect("missing resource mapping for stream lower")
+                else {
+                    unreachable!("invalid resource table observed during stream lower");
+                };
+
+                let stream_table_idx = stream_table_idx_ty.as_u32();
+
+                let (
+                    payload_type_name_js,
+                    lift_fn_js,
+                    lower_fn_js,
+                    payload_is_none,
+                    payload_is_numeric,
+                    payload_is_borrow,
+                    payload_is_async_value,
+                    payload_size32_js,
+                    payload_align32_js,
+                    payload_flat_count_js,
+                ) = match elem_ty {
+                    Some(PayloadTypeMetadata {
+                        ty: _,
+                        iface_ty,
+                        lift_js_expr,
+                        lower_js_expr,
+                        size32,
+                        align32,
+                        flat_count,
+                    }) => (
+                        format!("'{iface_ty:?}'"),
+                        lift_js_expr.as_str(),
+                        lower_js_expr.as_str(),
+                        "false",
+                        format!(
+                            "{}",
+                            matches!(
+                                iface_ty,
+                                InterfaceType::U8
+                                    | InterfaceType::U16
+                                    | InterfaceType::U32
+                                    | InterfaceType::U64
+                                    | InterfaceType::S8
+                                    | InterfaceType::S16
+                                    | InterfaceType::S32
+                                    | InterfaceType::S64
+                                    | InterfaceType::Float32
+                                    | InterfaceType::Float64
+                            )
+                        ),
+                        format!("{}", matches!(iface_ty, InterfaceType::Borrow(_))),
+                        format!(
+                            "{}",
+                            matches!(
+                                iface_ty,
+                                InterfaceType::Stream(_) | InterfaceType::Future(_)
+                            )
+                        ),
+                        size32.to_string(),
+                        align32.to_string(),
+                        flat_count.unwrap_or(0).to_string(),
+                    ),
+                    None => (
+                        "null".into(),
+                        "() => {{ throw new Error('no lift fn'); }}",
+                        "() => {{ throw new Error('no lower fn'); }}",
+                        "true",
+                        "false".into(),
+                        "false".into(),
+                        "false".into(),
+                        "null".into(),
+                        "null".into(),
+                        "0".into(),
+                    ),
+                };
+
+                // Set task memory index and memory object
+                let (component_idx_expr, get_realloc_fn_expr) =
+                    if let Some(state) = &self.component_state {
+                        let ComponentStateJsExprs {
+                            component_idx,
+                            get_realloc_fn,
+                            ..
+                        } = state.get_js_exprs();
+                        (component_idx, get_realloc_fn)
+                    } else {
+                        ("-1".into(), "undefined".into())
+                    };
+
+                let tmp = self.tmp();
+                let lowered_stream_waitable_idx = format!("streamWaitableIdx{tmp}");
+                uwriteln!(
+                    self.src,
+                    r#"
+                        if (!({async_iterator_symbol} in {stream_arg})
+                            && !({iterator_symbol} in {stream_arg})
+                            && !({stream_arg} instanceof {external_readable_stream_class})) {{
+                            {debug_log_fn}('[Instruction::StreamLower] object with no supported stream protocol', {{ {stream_arg} }});
+                            throw new Error('unrecognized stream object (no supported stream protocol)');
+                        }}
+
+                        const cstate{tmp} = {get_or_create_async_state_fn}({component_idx_expr});
+                        if (!cstate{tmp}) {{ throw new Error(`missing component state for component [{component_idx_expr}]`); }}
+
+                        const {{ writeEnd: hostWriteEnd{tmp}, readEnd: readEnd{tmp} }} = {create_stream_fn}(cstate{tmp}, {{
+                            tableIdx: {stream_table_idx},
+                            elemMeta: {{
+                                liftFn: {lift_fn_js},
+                                lowerFn: {lower_fn_js},
+                                payloadTypeName: {payload_type_name_js},
+                                isNone: {payload_is_none},
+                                isNumeric: {payload_is_numeric},
+                                isBorrowed: {payload_is_borrow},
+                                isAsyncValue: {payload_is_async_value},
+                                flatCount: {payload_flat_count_js},
+                                align32: {payload_align32_js},
+                                size32: {payload_size32_js},
+                                // TODO(feat): facilitate non utf8 string encoding for lowered streams
+                                stringEncoding: 'utf8',
+                                getReallocFn: {get_realloc_fn_expr},
+                            }},
+                        }});
+
+                        const readFn{tmp} = {gen_read_fn_from_lowerable_stream_fn}({stream_arg});
+
+                        const hostInjectFn{tmp} = {gen_stream_host_inject_fn}({{
+                            readFn: readFn{tmp},
+                            hostWriteEnd: hostWriteEnd{tmp},
+                            readEnd: readEnd{tmp},
+                        }});
+                        readEnd{tmp}.setHostInjectFn(hostInjectFn{tmp});
+                        readEnd{tmp}.setHostDropFn(readFn{tmp}.drop);
+
+                        const {lowered_stream_waitable_idx} = readEnd{tmp}.waitableIdx();
+                    "#
+                );
+
+                results.push(lowered_stream_waitable_idx);
+            }
+
+            Instruction::StreamLift { payload, ty } => {
+                let stream_new_from_lift_fn = self.intrinsic(Intrinsic::AsyncStream(
+                    AsyncStreamIntrinsic::StreamNewFromLift,
+                ));
+
+                // We must look up the type idx to find the stream
+                let type_id = &crate::dealias(self.resolve, *ty);
+                let ResourceTable {
+                    imported: true,
+                    data:
+                        ResourceData::Guest {
+                            extra:
+                                Some(ResourceExtraData::Stream {
+                                    table_idx: stream_table_idx_ty,
+                                    elem_ty: stream_element_ty,
+                                }),
+                            ..
+                        },
+                } = self
+                    .resource_map
+                    .get(type_id)
+                    .expect("missing resource mapping for stream lift")
+                else {
+                    unreachable!("invalid resource table observed during stream lift");
+                };
+
+                // if a stream element is present, it should match the payload we're getting
+                let (lift_fn_js, lower_fn_js) = match stream_element_ty {
+                    Some(PayloadTypeMetadata {
+                        ty,
+                        lift_js_expr,
+                        lower_js_expr,
+                        ..
+                    }) => {
+                        assert_eq!(Some(*ty), **payload, "stream element type mismatch");
+                        (lift_js_expr.to_string(), lower_js_expr.to_string())
+                    }
+                    None => (
+                        "() => {{ throw new Error('no lift fn'); }}".into(),
+                        "() => {{ throw new Error('no lower fn'); }}".into(),
+                    ),
+                };
+                if let Some(PayloadTypeMetadata { ty, .. }) = stream_element_ty {
+                    assert_eq!(Some(*ty), **payload, "stream element type mismatch");
+                }
+
+                let tmp = self.tmp();
+                let result_var = format!("streamResult{tmp}");
+
+                // Optionally preform the lift for the stream in question
+                match (
+                    self.canonical_abi_async,
+                    self.for_import.unwrap_or_default(),
+                ) {
+                    // It is possible for lifting to be called both at the *start* and *end* of
+                    // a given function depending on how it called:
+                    //
+                    // 1. lifting results to convert a component-produced result for use by the host *after* `CallWasm` returns
+                    // 2. lifting parameters (`stream` -> `AsyncIterator`), for use by the host, *before* `CallInterface`
+                    //
+                    // In (1), the function being generated must correspond to an export (from a component), and we only
+                    // perform the lifting if we know the value is imminently ready (i.e. the sync case).
+                    //
+                    // In (2) the function must correspond to an import (from the host), and regardless of whether
+                    // the function being generated is async or not, the host *must* deal in terms of lifted values
+                    // (i.e. `AsyncIterator`, not index to a stream)
+                    //
+                    (_is_async @ false, _for_import @ false) | (_is_async, _for_import @ true) => {
+                        let arg_stream_end_idx = operands
+                            .first()
+                            .expect("unexpectedly missing stream end return arg in StreamLift");
+
+                        let (payload_ty_size32_js, payload_ty_align32_js) =
+                            if let Some(payload_ty) = payload {
+                                (
+                                    self.sizes.size(payload_ty).size_wasm32().to_string(),
+                                    self.sizes.align(payload_ty).align_wasm32().to_string(),
+                                )
+                            } else {
+                                ("null".into(), "null".into())
+                            };
+
+                        let stream_table_idx = stream_table_idx_ty.as_u32();
+
+                        // Set task memory index and memory object
+                        let component_idx_expr = if let Some(state) = &self.component_state {
+                            let ComponentStateJsExprs { component_idx, .. } = state.get_js_exprs();
+                            component_idx
+                        } else {
+                            "-1".into()
+                        };
+
+                        uwriteln!(
+                            self.src,
+                            r#"
+                              const {result_var} = {stream_new_from_lift_fn}({{
+                                  componentIdx: {component_idx_expr},
+                                  streamTableIdx: {stream_table_idx},
+                                  streamEndWaitableIdx: {arg_stream_end_idx},
+                                  payloadLiftFn: {lift_fn_js},
+                                  payloadLowerFn: {lower_fn_js},
+                                  payloadTypeSize32: {payload_ty_size32_js},
+                                  payloadTypeAlign32: {payload_ty_align32_js},
+                              }});
+                            "#,
+                        );
+                    }
+
+                    // For other cases, we can do nothing as the future idx passes right through
+                    _ => {}
+                };
+
+                // TODO(fix): in the async case we return an uninitialized var, which should not be necessary
+                results.push(result_var.clone());
+            }
+
+            // Instruction::AsyncTaskReturn does *not* correspond to an canonical `task.return`,
+            // but rather to a "return"/exit from an a lifted async function (e.g. pre-callback)
+            //
+            // To modify behavior of the `task.return` intrinsic, see:
+            //   - `Trampoline::TaskReturn`
+            //   - `AsyncTaskIntrinsic::TaskReturn`
+            //
+            // This is simply the end of the async function definition (e.g. `CallWasm`) that has been
+            // lifted, which contains information about the async state.
+            //
+            // For an async function 'some-func', this instruction is triggered w/ the following `name`s:
+            // - '[task-return]some-func'
+            //
+            // At this point in code generation, the following things have already been set:
+            // - `parentTask`: A parent task, if one was executing before
+            // - `subtask`: A subtask, if the current task is a subtask of a parent task
+            // - `task`: the currently executing task
+            // - `ret`: the original function return value, via (i.e. via `CallWasm`/`CallInterface`)
+            // - `hostProvided`: whether the original function was a host-provided (i.e. host provided import)
+            //
+            Instruction::AsyncTaskReturn { name, params } => {
+                let (direct_result_lift, direct_result) = self
+                    .lift_callbackless_async_result()
+                    .unwrap_or_else(|| (String::new(), "ret".into()));
+                let return_direct_result = if self.wrap_async_future_result {
+                    format!("{{ value: {direct_result} }}")
+                } else {
+                    direct_result.clone()
+                };
+                let debug_log_fn = self.intrinsic(Intrinsic::DebugLog);
+                let is_async_js = self.requires_async_porcelain | self.is_async;
+                let async_driver_loop_fn =
+                    self.intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::DriverLoop));
+                let get_or_create_async_state_fn = self.intrinsic(Intrinsic::Component(
+                    ComponentIntrinsic::GetOrCreateAsyncState,
+                ));
+
+                // Set task memory index and memory object
+                let component_idx_expr = if let Some(state) = &self.component_state {
+                    let ComponentStateJsExprs { component_idx, .. } = state.get_js_exprs();
+                    component_idx
+                } else {
+                    "-1".into()
+                };
+
+                let throw_result_err = if self.no_component_error_wrapping {
+                    "throw taskRes.val;".to_string()
+                } else {
+                    let component_err = self.intrinsic(Intrinsic::ComponentError);
+                    format!("throw new {component_err}(taskRes.val);")
+                };
+
+                uwriteln!(
+                    self.src,
+                    "{debug_log_fn}('{prefix}  [Instruction::AsyncTaskReturn]', {{
+                         funcName: '{name}',
+                         paramCount: {param_count},
+                         componentIdx: {component_idx_expr},
+                         postReturn: {post_return_present},
+                         hostProvided,
+                      }});",
+                    param_count = params.len(),
+                    post_return_present = self.post_return.is_some(),
+                    prefix = self.tracing_prefix,
+                );
+
+                assert!(
+                    self.is_async,
+                    "non-async functions should not be performing async returns (func {name})",
+                );
+
+                // If we're dealing with an async call, then `ret` is actually the
+                // state of async behavior.
+                //
+                // The result *should* be a Promise that resolves to whatever the current task
+                // will eventually resolve to.
+                //
+                // NOTE: Regardless of whether async porcelain is required here, we want to return the result
+                // of the computation as a whole, not the current async state (which is what `ret` currently is).
+                //
+                // `ret` is only a Promise if we have async-lowered the function in question (e.g. via JSPI)
+                //
+                // ```ts
+                // type ret = number | Promise<number>;
+                // ```ts
+                //
+                // If the import was host provided we *already* have the result via
+                // JSPI and simply calling the host provided JS function -- there is no need
+                // to drive the async loop as with an async import that came from a component.
+                //
+                // If a subtask is defined, then we're in the case of a lowered async import,
+                // which means that the first async call (to the callee fn) has occurred,
+                // and a subtask has been created, but has not been triggered as started.
+                //
+                // NOTE: for host provided functions, we know that the resolution fo the
+                // function itself are the lifted (component model -- i.e. a string not a pointer + len)
+                // results. In those cases, we can simply return the result that was provided by the host.
+                //
+                // Alternatively, if we have entered an async return, and are part of a subtask
+                // then we should start it, given that the task we have recently created (however we got to
+                // the async return) is going to continue to be polled soon (via the driver loop).
+                //
+                // Host-import tasks may be parented by a canonical ABI subtask. Their
+                // resolution is propagated to that subtask, and their own completion
+                // promise is intentionally left unsettled, so return the lifted host
+                // value directly after resolving and exiting the task.
+                uwriteln!(
+                    self.src,
+                    r#"
+                      if (hostProvided) {{
+                          {debug_log_fn}('[Instruction::AsyncTaskReturn] signaling host-provided async return completion', {{
+                              task: task.id(),
+                              subtask: subtask?.id(),
+                              result: ret,
+                          }})
+                          task.resolve([ret]);
+                          task.exit();
+                          return ret;
+                      }}
+
+                      // An async lift without a callback (stackful) is done when its core
+                      // function returns, but that function returns no values: the result
+                      // comes only from `task.return`, and returning without having called
+                      // it traps (`task.exit()` throws in that case).
+                      if (!task.hasCallback()) {{
+                          if (!task.isResolvedState() && ret !== undefined) {{
+                              // (legacy: a core function that returns its result directly)
+                              {direct_result_lift}
+                              task.resolve([{direct_result}]);
+                              task.exit();
+                              return {return_direct_result};
+                          }}
+                          task.exit();
+                          let taskRes = await task.completionPromise();
+                          if (task.getErrHandling() === 'throw-result-err') {{
+                              if (typeof taskRes !== 'object') {{
+                                  return {return_task_res};
+                              }}
+                              if (taskRes.tag === 'err') {{ {throw_result_err} }}
+                              if (taskRes.tag === 'ok') {{ taskRes = taskRes.val; }}
+                          }}
+                          return {return_task_res};
+                      }}
+
+                      const componentState = {get_or_create_async_state_fn}({component_idx_expr});
+                      if (!componentState) {{ throw new Error('failed to lookup current component state'); }}
+
+                      queueMicrotask(async (resolve, reject) => {{
+                          try {{
+                              {debug_log_fn}("[Instruction::AsyncTaskReturn] starting driver loop", {{
+                                  fnName: '{name}',
+                                  componentInstanceIdx: {component_idx_expr},
+                                  taskID: task.id(),
+                              }});
+                              await {async_driver_loop_fn}({{
+                                  componentInstanceIdx: {component_idx_expr},
+                                  componentState,
+                                  task,
+                                  fnName: '{name}',
+                                  isAsync: {is_async_js},
+                                  callbackResult: ret,
+                              }});
+                          }} catch (err) {{
+                              {debug_log_fn}("[Instruction::AsyncTaskReturn] driver loop call failure", {{ err }});
+                          }}
+                      }});
+
+                      let taskRes = await task.completionPromise();
+                      if (task.getErrHandling() === 'throw-result-err') {{
+                          if (typeof taskRes !== 'object') {{
+                              return {return_task_res};
+                          }}
+                          if (taskRes.tag === 'err') {{ {throw_result_err} }}
+                          if (taskRes.tag === 'ok') {{ taskRes = taskRes.val; }}
+                      }}
+
+                      return {return_task_res};
+                      "#,
+                    // If we are returning the task result post-resolution, and it contains a future<t>,
+                    // we must wrap the result so we can deal with nesting if present
+                    return_task_res = if self.wrap_async_future_result {
+                        "{ value: taskRes }"
+                    } else {
+                        "taskRes"
+                    },
+                    return_direct_result = return_direct_result,
+                );
+            }
+
+            Instruction::GuestDeallocate { size, align } => {
+                let size = size.size_wasm32();
+                if size != 0 {
+                    let dealloc = self
+                        .dealloc
+                        .expect("guest deallocation requires a dealloc function");
+                    uwriteln!(
+                        self.src,
+                        "{dealloc}(({}) >>> 0, {size}, {});",
+                        operands[0],
+                        align.align_wasm32()
+                    );
+                }
+            }
+
+            Instruction::GuestDeallocateString => {
+                let tmp = self.tmp();
+                let ptr = format!("ptr{tmp}");
+                let tagged_code_units = format!("taggedCodeUnits{tmp}");
+                uwriteln!(self.src, "const {ptr} = ({}) >>> 0;", operands[0]);
+                uwriteln!(
+                    self.src,
+                    "const {tagged_code_units} = ({}) >>> 0;",
+                    operands[1]
+                );
+                match self.encoding {
+                    StringEncoding::UTF8 => self.emit_guest_dealloc(&ptr, &tagged_code_units, 1, 1),
+                    StringEncoding::UTF16 => {
+                        self.emit_guest_dealloc(&ptr, &tagged_code_units, 2, 2)
+                    }
+                    StringEncoding::CompactUTF16 => {
+                        // For wasm32, bit 31 tags a UTF-16 code-unit count; without it,
+                        // the length counts Latin-1 bytes. See `load_string_from_range`:
+                        // https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#loading
+                        let tag = format!("tag{tmp}");
+                        let byte_length = format!("byteLength{tmp}");
+                        uwriteln!(self.src, "const {tag} = 2 ** 31;");
+                        uwriteln!(
+                            self.src,
+                            "let {byte_length};
+                            if ({tagged_code_units} & {tag}) {{
+                                {byte_length} = 2 * ({tagged_code_units} ^ {tag});
+                            }} else {{
+                                {byte_length} = {tagged_code_units};
+                            }}"
+                        );
+                        self.emit_guest_dealloc(&ptr, &byte_length, 1, 2);
+                    }
+                }
+            }
+
+            Instruction::GuestDeallocateList { element } => {
+                self.emit_dealloc_list_or_map(
+                    operands,
+                    self.sizes.size(element).size_wasm32(),
+                    self.sizes.align(element).align_wasm32(),
+                );
+            }
+
+            Instruction::GuestDeallocateMap { key, value } => {
+                let entry = self.sizes.record([*key, *value]);
+                self.emit_dealloc_list_or_map(
+                    operands,
+                    entry.size.size_wasm32(),
+                    entry.align.align_wasm32(),
+                );
+            }
+
+            Instruction::GuestDeallocateVariant { blocks } => {
+                let blocks = self.blocks.split_off(self.blocks.len() - blocks);
+                uwriteln!(self.src, "switch ({}) {{", operands[0]);
+                for (i, (body, results)) in blocks.into_iter().enumerate() {
+                    assert!(results.is_empty());
+                    uwriteln!(
+                        self.src,
+                        "case {i}: {{
+                            {body}
+                            break;
+                        }}"
+                    );
+                }
+                if !self.valid_lifting_optimization {
+                    uwriteln!(
+                        self.src,
+                        "default: {{
+                            throw new TypeError('invalid variant discriminant for deallocation');
+                        }}"
+                    );
+                }
+                uwriteln!(self.src, "}}");
+            }
+        }
+    }
+}
+
+/// Tests whether `ty` can be represented with `null`, and if it can then
+/// the "other type" is returned. If `Some` is returned that means that `ty`
+/// is `null | <return>`. If `None` is returned that means that `null` can't
+/// be used to represent `ty`.
+pub fn as_nullable<'a>(resolve: &'a Resolve, ty: &'a Type) -> Option<&'a Type> {
+    let id = match ty {
+        Type::Id(id) => *id,
+        _ => return None,
+    };
+    match &resolve.types[id].kind {
+        // If `ty` points to an `option<T>`, then `ty` can be represented
+        // with `null` if `t` itself can't be represented with null. For
+        // example `option<option<u32>>` can't be represented with `null`
+        // since that's ambiguous if it's `none` or `some(none)`.
+        //
+        // Note, oddly enough, that `option<option<option<u32>>>` can be
+        // represented as `null` since:
+        //
+        // * `null` => `none`
+        // * `{ tag: "none" }` => `some(none)`
+        // * `{ tag: "some", val: null }` => `some(some(none))`
+        // * `{ tag: "some", val: 1 }` => `some(some(some(1)))`
+        //
+        // It's doubtful anyone would actually rely on that though due to
+        // how confusing it is.
+        TypeDefKind::Option(t) => {
+            if !maybe_null(resolve, t) {
+                Some(t)
+            } else {
+                None
+            }
+        }
+        TypeDefKind::Type(t) => as_nullable(resolve, t),
+        _ => None,
+    }
+}
+
+pub fn maybe_null(resolve: &Resolve, ty: &Type) -> bool {
+    as_nullable(resolve, ty).is_some()
+}
+
+/// Retrieve the specialized JS array type that would contain a given element type,
+/// if one exists.
+///
+/// e.g. a Wasm [`Type::U8`] would be represetned by a JS `Uint8Array`
+///
+/// # Arguments
+///
+/// * `resolve` - The [`Resolve`] used to look up nested type IDs if necessary
+/// * `element_ty` - The [`Type`] that represents elements of the array
+pub fn js_array_ty(resolve: &Resolve, element_ty: &Type) -> Option<&'static str> {
+    match element_ty {
+        Type::Bool => None,
+        Type::U8 => Some("Uint8Array"),
+        Type::S8 => Some("Int8Array"),
+        Type::U16 => Some("Uint16Array"),
+        Type::S16 => Some("Int16Array"),
+        Type::U32 => Some("Uint32Array"),
+        Type::S32 => Some("Int32Array"),
+        Type::U64 => Some("BigUint64Array"),
+        Type::S64 => Some("BigInt64Array"),
+        Type::F32 => Some("Float32Array"),
+        Type::F64 => Some("Float64Array"),
+        Type::Char => None,
+        Type::String => None,
+        Type::ErrorContext => None,
+        Type::Id(id) => match &resolve.types[*id].kind {
+            // Recur to resolve type aliases, etc.
+            TypeDefKind::Type(t) => js_array_ty(resolve, t),
+            _ => None,
+        },
+    }
+}
+
+/// Generate the JS `DataView` set and numeric checks for a given numeric type
+///
+/// # Arguments
+///
+/// * `ty` - the [`Type`] to check
+///
+fn gen_dataview_set_and_check_fn_js_for_numeric_type(
+    resolve: &Resolve,
+    ty: &Type,
+) -> (&'static str, String) {
+    let check_fn = Intrinsic::Conversion(ConversionIntrinsic::RequireValidNumericPrimitive).name();
+    match ty {
+        // Unsigned Integers
+        Type::Bool => ("setUint8", format!("{check_fn}.bind(null, 'u8')",)),
+        Type::U8 => ("setUint8", format!("{check_fn}.bind(null, 'u8')",)),
+        Type::U16 => ("setUint16", format!("{check_fn}.bind(null, 'u16')",)),
+        Type::U32 => ("setUint32", format!("{check_fn}.bind(null, 'u32')",)),
+        Type::U64 => ("setBigUint64", format!("{check_fn}.bind(null, 'u64')",)),
+        // Signed integers
+        Type::S8 => ("setInt8", format!("{check_fn}.bind(null, 's8')",)),
+        Type::S16 => ("setInt16", format!("{check_fn}.bind(null, 's16')",)),
+        Type::S32 => ("setInt32", format!("{check_fn}.bind(null, 's32')",)),
+        Type::S64 => ("setBigInt64", format!("{check_fn}.bind(null, 's64')",)),
+        // Floating point
+        Type::F32 => ("setFloat32", format!("{check_fn}.bind(null, 'f32')",)),
+        Type::F64 => ("setFloat64", format!("{check_fn}.bind(null, 'f64')",)),
+        Type::Id(id) => match resolve.types.get(*id) {
+            // Type aliases should resolve to types that have the kind `TypeDefKind::Type`
+            Some(TypeDef {
+                kind: TypeDefKind::Type(inner_ty),
+                ..
+            }) => gen_dataview_set_and_check_fn_js_for_numeric_type(resolve, inner_ty),
+            // We do not expect to resolve to types that *do not* have the `TypeDefKind::Type(...)`
+            Some(inner_ty) => {
+                unreachable!(
+                    "unexpected non-type-kind typedef [{inner_ty:?}] (as type {ty:?}) for canonical list lower [{ty:?}]",
+                )
+            }
+            // All type ids should resolve via the passed in `Resolve`
+            None => unreachable!("missing/unresolvable type [{ty:?}]"),
+        },
+        _ => unreachable!("unsupported type [{ty:?}] for canonical list lower"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn result_wrapper_detection_preserves_ambiguous_success_payloads() {
+        let mut resolve = Resolve::new();
+        let package = resolve
+            .push_str(
+                std::path::Path::new("result-wrappers.wit"),
+                r#"
+                    package test:result-wrappers;
+
+                    interface imports {
+                        variant ordinary-variant { a(u32), b }
+                        variant ok-variant { ok(u32), other }
+                        record tagged-record { tag: string, val: u32 }
+
+                        primitive: func() -> result<u32, string>;
+                        ordinary: func() -> result<ordinary-variant, string>;
+                        ok-case: func() -> result<ok-variant, string>;
+                        nested: func() -> result<result<u32, string>, string>;
+                        tagged: func() -> result<tagged-record, string>;
+                    }
+                "#,
+            )
+            .unwrap();
+        let interface = resolve.packages[package].interfaces["imports"];
+
+        let tags_for = |name: &str| {
+            let ok = get_thrown_type(
+                &resolve,
+                resolve.interfaces[interface].functions[name].result,
+            )
+            .unwrap()
+            .0;
+            unambiguous_result_wrapper_tags(&resolve, ok)
+        };
+
+        assert_eq!(tags_for("primitive"), (true, true));
+        assert_eq!(tags_for("ordinary"), (true, true));
+        assert_eq!(tags_for("ok-case"), (false, true));
+        assert_eq!(tags_for("nested"), (false, false));
+        assert_eq!(tags_for("tagged"), (false, false));
+    }
+
+    #[test]
+    fn test_alias_type_gen_dataview_set_and_check_fn_js_for_numeric_type() {
+        let mut resolve = Resolve::new();
+
+        let owner = wit_parser::TypeOwner::Interface(resolve.interfaces.next_id());
+
+        let ty_id = resolve.types.alloc(wit_parser::TypeDef {
+            name: None,
+            kind: TypeDefKind::Type(Type::U64),
+            docs: Default::default(),
+            stability: Default::default(),
+            owner,
+            span: Default::default(),
+            external_id: None,
+        });
+
+        let ty_ = Type::Id(ty_id);
+
+        let (dataview_set_method, check_fn_intrinsic) =
+            gen_dataview_set_and_check_fn_js_for_numeric_type(&resolve, &ty_);
+
+        assert_eq!(dataview_set_method, "setBigUint64");
+
+        let check_fn =
+            Intrinsic::Conversion(ConversionIntrinsic::RequireValidNumericPrimitive).name();
+
+        assert_eq!(check_fn_intrinsic, format!("{check_fn}.bind(null, 'u64')",));
+    }
+}

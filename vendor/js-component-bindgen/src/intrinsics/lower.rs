@@ -1,0 +1,1365 @@
+//! Intrinsics that represent helpers that enable Lower integration
+use std::fmt::Write;
+
+use crate::intrinsics::component::ComponentIntrinsic;
+use crate::intrinsics::p3::async_future::AsyncFutureIntrinsic;
+use crate::intrinsics::p3::async_stream::AsyncStreamIntrinsic;
+use crate::intrinsics::p3::error_context::ErrCtxIntrinsic;
+use crate::intrinsics::string::StringIntrinsic;
+use crate::intrinsics::{Intrinsic, RenderIntrinsicsArgs};
+use crate::source::Source;
+use crate::uwriteln;
+
+use super::conversion::ConversionIntrinsic;
+
+/// This enum contains intrinsics that enable Lower
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub enum LowerIntrinsic {
+    /// Lower a boolean into provided storage, given a core type
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value.
+    LowerFlatBool,
+
+    /// Lower a s8 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -128 to 127.
+    LowerFlatS8,
+
+    /// Lower a u8 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 255.
+    LowerFlatU8,
+
+    /// Lower a s16 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -32,768 to 32,767.
+    LowerFlatS16,
+
+    /// Lower a u16 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 65,535.
+    LowerFlatU16,
+
+    /// Lower a s32 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -2,147,483,648 to 2,147,483,647.
+    LowerFlatS32,
+
+    /// Lower a u32 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 4,294,967,295.
+    LowerFlatU32,
+
+    /// Lower a s64 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807
+    LowerFlatS64,
+
+    /// Lower a u64 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 18,446,744,073,709,551,615.
+    LowerFlatU64,
+
+    /// Lower a f32 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    LowerFlatFloat32,
+
+    /// Lower a f64 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    LowerFlatFloat64,
+
+    /// Lower a char into provided storage given core type(s)
+    LowerFlatChar,
+
+    /// Lower a string into provided storage given core type(s), using encoding in lower ctx
+    LowerFlatStringAny,
+
+    /// Lower a UTF8 string into provided storage given core type(s)
+    LowerFlatStringUtf8,
+
+    /// Lower a UTF16 string into provided storage given core type(s)
+    LowerFlatStringUtf16,
+
+    /// Lower a record into provided storage given core type(s)
+    LowerFlatRecord,
+
+    /// Lower a variant into provided storage given core type(s)
+    LowerFlatVariant,
+
+    /// Lower a list into provided storage given core type(s)
+    LowerFlatList,
+
+    /// Lower a map into provided storage given core type(s)
+    LowerFlatMap,
+
+    /// Lower a tuple into provided storage given core type(s)
+    LowerFlatTuple,
+
+    /// Lower flags into provided storage given core type(s)
+    LowerFlatFlags,
+
+    /// Lower flags into provided storage given core type(s)
+    LowerFlatEnum,
+
+    /// Lower an option into provided storage given core type(s)
+    LowerFlatOption,
+
+    /// Lower a result into provided storage given core type(s)
+    LowerFlatResult,
+
+    /// Lower a owned resource into provided storage given core type(s)
+    LowerFlatOwn,
+
+    /// Lower a borrowed resource into provided storage given core type(s)
+    LowerFlatBorrow,
+
+    /// Lower a future into provided storage given core type(s)
+    LowerFlatFuture,
+
+    /// Lower a stream into provided storage given core type(s)
+    LowerFlatStream,
+
+    /// Lower an error-context into provided storage given core type(s)
+    LowerFlatErrorContext,
+}
+
+/// Generate JS that checks whether the value about to be lowered (`ctx.vals[0]`)
+/// is valid for the given primitive type
+///
+/// Values are only checked when strict type checks are enabled, otherwise they
+/// are coerced when they are written to memory.
+fn strict_check_js(render_args: &RenderIntrinsicsArgs<'_>, ty: &str) -> String {
+    if !render_args.transpile_opts.strict {
+        return String::new();
+    }
+    if ty == "bool" {
+        return "if (typeof ctx.vals[0] !== 'boolean') { throw new TypeError(`invalid bool value [${ctx.vals[0]}]`); }".into();
+    }
+    let require_valid_numeric_primitive_fn = render_args.require_intrinsic(Intrinsic::Conversion(
+        ConversionIntrinsic::RequireValidNumericPrimitive,
+    ));
+    format!("{require_valid_numeric_primitive_fn}('{ty}', ctx.vals[0]);")
+}
+impl LowerIntrinsic {
+    /// Retrieve global names for
+    pub fn get_global_names() -> impl IntoIterator<Item = &'static str> {
+        []
+    }
+
+    /// Get the name for the intrinsic
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::LowerFlatBool => "_lowerFlatBool",
+            Self::LowerFlatS8 => "_lowerFlatS8",
+            Self::LowerFlatU8 => "_lowerFlatU8",
+            Self::LowerFlatS16 => "_lowerFlatS16",
+            Self::LowerFlatU16 => "_lowerFlatU16",
+            Self::LowerFlatS32 => "_lowerFlatS32",
+            Self::LowerFlatU32 => "_lowerFlatU32",
+            Self::LowerFlatS64 => "_lowerFlatS64",
+            Self::LowerFlatU64 => "_lowerFlatU64",
+            Self::LowerFlatFloat32 => "_lowerFlatFloat32",
+            Self::LowerFlatFloat64 => "_lowerFlatFloat64",
+            Self::LowerFlatChar => "_lowerFlatChar",
+            Self::LowerFlatStringAny => "_lowerFlatStringAny",
+            Self::LowerFlatStringUtf8 => "_lowerFlatStringUTF8",
+            Self::LowerFlatStringUtf16 => "_lowerFlatStringUTF16",
+            Self::LowerFlatRecord => "_lowerFlatRecord",
+            Self::LowerFlatVariant => "_lowerFlatVariant",
+            Self::LowerFlatList => "_lowerFlatList",
+            Self::LowerFlatMap => "_lowerFlatMap",
+            Self::LowerFlatTuple => "_lowerFlatTuple",
+            Self::LowerFlatFlags => "_lowerFlatFlags",
+            Self::LowerFlatEnum => "_lowerFlatEnum",
+            Self::LowerFlatOption => "_lowerFlatOption",
+            Self::LowerFlatResult => "_lowerFlatResult",
+            Self::LowerFlatOwn => "_lowerFlatOwn",
+            Self::LowerFlatBorrow => "_lowerFlatBorrow",
+            Self::LowerFlatFuture => "_lowerFlatFuture",
+            Self::LowerFlatStream => "_lowerFlatStream",
+            Self::LowerFlatErrorContext => "_lowerFlatErrorContext",
+        }
+    }
+
+    /// Render an intrinsic to a string
+    pub fn render(&self, output: &mut Source, render_args: &RenderIntrinsicsArgs<'_>) {
+        match self {
+            Self::LowerFlatBool => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let strict_check = strict_check_js(render_args, "bool");
+                output.push_str(&format!(r#"
+                    function _lowerFlatBool(ctx) {{
+                        {debug_log_fn}('[_lowerFlatBool()] args', {{ ctx }});
+
+                        if (!ctx.memory) {{ throw new Error("missing memory for lower"); }}
+                        if (ctx.vals.length !== 1) {{
+                            throw new Error(`unexpected number [${{ctx.vals.length}}] of vals (expected 1)`);
+                        }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setUint8(ctx.storagePtr, ctx.vals[0] ? 1 : 0);
+
+                        ctx.storagePtr += 1;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatS8 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let strict_check = strict_check_js(render_args, "s8");
+                output.push_str(&format!(r#"
+                    function _lowerFlatS8(ctx) {{
+                        {debug_log_fn}('[_lowerFlatS8()] args', {{ ctx }});
+
+                        if (ctx.vals.length !== 1) {{
+                            throw new Error(`unexpected number [${{ctx.vals.length}}] of vals (expected 1)`);
+                        }}
+                        if (!ctx.memory) {{ throw new Error("missing memory for lower"); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setInt8(ctx.storagePtr, ctx.vals[0]);
+
+                        ctx.storagePtr += 1;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatU8 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_u8_fn = self.name();
+                let strict_check = strict_check_js(render_args, "u8");
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_u8_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_u8_fn}()] args', ctx);
+
+                        if (ctx.vals.length !== 1) {{
+                            throw new Error(`unexpected number [${{ctx.vals.length}}] of vals (expected 1)`);
+                        }}
+
+                        {strict_check}
+
+                        if (!ctx.memory) {{ throw new Error("missing memory for lower"); }}
+                        new DataView(ctx.memory.buffer).setUint8(ctx.storagePtr, ctx.vals[0]);
+
+                        ctx.storagePtr += 1;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatS16 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_s16_fn = self.name();
+                let strict_check = strict_check_js(render_args, "s16");
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_s16_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_s16_fn}()] args', {{ ctx }});
+
+                        if (!ctx.memory) {{ throw new Error("missing memory for lower"); }}
+                        if (ctx.vals.length !== 1) {{
+                            throw new Error(`unexpected number [${{ctx.vals.length}}] of vals (expected 1)`);
+                        }}
+
+                        const rem = ctx.storagePtr % 2;
+                        if (rem !== 0) {{ ctx.storagePtr += (2 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setInt16(ctx.storagePtr, ctx.vals[0], true);
+
+                        ctx.storagePtr += 2;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatU16 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_u16_fn = self.name();
+                let strict_check = strict_check_js(render_args, "u16");
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_u16_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_u16_fn}()] args', {{ ctx }});
+
+                        if (!ctx.memory) {{ throw new Error("missing memory for lower"); }}
+                        if (ctx.vals.length !== 1) {{
+                            throw new Error(`unexpected number [${{ctx.vals.length}}] of vals (expected 1)`);
+                        }}
+
+                        const rem = ctx.storagePtr % 2;
+                        if (rem !== 0) {{ ctx.storagePtr += (2 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setUint16(ctx.storagePtr, ctx.vals[0], true);
+
+                        ctx.storagePtr += 2;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatS32 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_s32_fn = self.name();
+                let strict_check = strict_check_js(render_args, "s32");
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_s32_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_s32_fn}()] args', {{ ctx }});
+
+                        if (ctx.vals.length !== 1) {{
+                            throw new Error(`unexpected number [${{ctx.vals.length}}] of vals (expected 1)`);
+                        }}
+
+                        const rem = ctx.storagePtr % 4;
+                        if (rem !== 0) {{ ctx.storagePtr += (4 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setInt32(ctx.storagePtr, ctx.vals[0], true);
+
+                        ctx.storagePtr += 4;
+                    }}
+                "#));
+            }
+
+            // TODO(fix) can u32s be lowered indirectly? maybe never?
+            // discrepancy of indirect values and indirect params (where to get storagePtr/len)
+            // to the function versus params that actually indicate where to write!
+            Self::LowerFlatU32 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_u32_fn = self.name();
+                let strict_check = strict_check_js(render_args, "u32");
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_u32_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_u32_fn}()] args', {{ ctx }});
+
+                        if (ctx.vals.length !== 1) {{
+                            throw new Error(`expected single value to lower, got [${{ctx.vals.length}}]`);
+                        }}
+
+                        const rem = ctx.storagePtr % 4;
+                        if (rem !== 0) {{ ctx.storagePtr += (4 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setUint32(ctx.storagePtr, ctx.vals[0], true);
+
+                        ctx.storagePtr += 4;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatS64 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_s64_fn = self.name();
+                let strict_check = strict_check_js(render_args, "s64");
+
+                output.push_str(&format!("
+                    function {lower_flat_s64_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_s64_fn}()] args', {{ ctx }});
+
+                        if (ctx.vals.length !== 1) {{ throw new Error('unexpected number of vals'); }}
+
+                        const rem = ctx.storagePtr % 8;
+                        if (rem !== 0) {{ ctx.storagePtr += (8 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setBigInt64(ctx.storagePtr, ctx.vals[0], true);
+
+
+                        ctx.storagePtr += 8;
+                    }}
+                "));
+            }
+
+            Self::LowerFlatU64 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_u64_fn = self.name();
+                let strict_check = strict_check_js(render_args, "u64");
+
+                output.push_str(&format!("
+                    function {lower_flat_u64_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_u64_fn}()] args', {{ ctx }});
+
+                        if (ctx.vals.length !== 1) {{ throw new Error('unexpected number of vals'); }}
+
+                        const rem = ctx.storagePtr % 8;
+                        if (rem !== 0) {{ ctx.storagePtr += (8 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setBigUint64(ctx.storagePtr, ctx.vals[0], true);
+
+                        ctx.storagePtr += 8;
+                    }}
+                "));
+            }
+
+            Self::LowerFlatFloat32 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_f32_fn = self.name();
+                let strict_check = strict_check_js(render_args, "f32");
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_f32_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_f32_fn}()] args', {{ ctx }});
+
+                        if (ctx.vals.length !== 1) {{ throw new Error('unexpected number of vals'); }}
+
+                        const rem = ctx.storagePtr % 4;
+                        if (rem !== 0) {{ ctx.storagePtr += (4 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setFloat32(ctx.storagePtr, ctx.vals[0], true);
+
+                        ctx.storagePtr += 4;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatFloat64 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_f64_fn = self.name();
+                let strict_check = strict_check_js(render_args, "f64");
+
+                output.push_str(&format!("
+                    function {lower_flat_f64_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_f64_fn}()] args', {{ ctx }});
+
+                        if (ctx.vals.length !== 1) {{ throw new Error('unexpected number of vals'); }}
+
+                        const rem = ctx.storagePtr % 8;
+                        if (rem !== 0) {{ ctx.storagePtr += (8 - rem); }}
+
+                        {strict_check}
+                        new DataView(ctx.memory.buffer).setFloat64(ctx.storagePtr, ctx.vals[0], true);
+
+                        ctx.storagePtr += 8;
+                    }}
+                "));
+            }
+
+            Self::LowerFlatChar => {
+                let i32_to_char_fn = render_args
+                    .require_intrinsic(Intrinsic::Conversion(ConversionIntrinsic::I32ToChar));
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                output.push_str(&format!("
+                    function _lowerFlatChar(ctx) {{
+                        {debug_log_fn}('[_lowerFlatChar()] args', {{ ctx }});
+
+                        const rem = ctx.storagePtr % 4;
+                        if (rem !== 0) {{ ctx.storagePtr += (4 - rem); }}
+
+                        if (ctx.vals.length !== 1) {{ throw new Error('unexpected number of vals'); }}
+                        new DataView(ctx.memory.buffer).setUint32(ctx.storagePtr, {i32_to_char_fn}(ctx.vals[0]), true);
+
+                        ctx.storagePtr += 4;
+                    }}
+                "));
+            }
+
+            Self::LowerFlatStringAny => {
+                let lower_flat_string_any_fn = self.name();
+                let lower_flat_string_utf8_fn =
+                    render_args.require_intrinsic(Self::LowerFlatStringUtf8);
+                let lower_flat_string_utf16_fn =
+                    render_args.require_intrinsic(Self::LowerFlatStringUtf16);
+                output.push_str(&format!("
+                    function {lower_flat_string_any_fn}(ctx) {{
+                        switch (ctx.stringEncoding) {{
+                            case 'utf8':
+                                return {lower_flat_string_utf8_fn}(ctx);
+                            case 'utf16':
+                                return {lower_flat_string_utf16_fn}(ctx);
+                            default:
+                                throw new Error(`missing/unrecognized/unsupported string encoding [${{ctx.stringEncoding}}]`);
+                        }}
+                    }}
+                "));
+            }
+
+            Self::LowerFlatStringUtf16 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_string_utf16_fn = self.name();
+                let utf16_encode_fn =
+                    render_args.require_intrinsic(Intrinsic::String(StringIntrinsic::Utf16Encode));
+
+                output.push_str(&format!("
+                    function {lower_flat_string_utf16_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_string_utf16_fn}()] args', {{ ctx }});
+                        if (!ctx.realloc) {{ throw new Error('missing realloc during flat string lower'); }}
+
+                        const {{ ptr, len }} = {utf16_encode_fn}(ctx.vals[0], ctx.realloc, ctx.memory);
+
+                        const view = new DataView(ctx.memory.buffer);
+                        view.setUint32(ctx.storagePtr, ptr, true);
+                        view.setUint32(ctx.storagePtr + 4, len, true);
+
+                        ctx.storagePtr += 8;
+                    }}
+                "));
+            }
+
+            Self::LowerFlatStringUtf8 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_string_utf8_fn = self.name();
+                let utf8_encode_fn =
+                    render_args.require_intrinsic(Intrinsic::String(StringIntrinsic::Utf8Encode));
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_string_utf8_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_string_utf8_fn}()] args', ctx);
+                        if (!ctx.realloc) {{ throw new Error('missing realloc during flat string lower'); }}
+
+                        const {{ ptr, len }} = {utf8_encode_fn}(ctx.vals[0], ctx.realloc, ctx.memory);
+
+                        const view = new DataView(ctx.memory.buffer);
+                        view.setUint32(ctx.storagePtr, ptr, true);
+                        view.setUint32(ctx.storagePtr + 4, len, true);
+
+                        ctx.storagePtr += 8;
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatRecord => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_record_fn = self.name();
+
+                output.push_str(&format!(
+                    r#"
+                    function {lower_flat_record_fn}(meta) {{
+                        const {{ fieldMetas, size32: recordSize32, align32: recordAlign32 }} = meta;
+                        return function {lower_flat_record_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_record_fn}()] args', {{ ctx }});
+
+                            const originalPtr = ctx.storagePtr;
+                            const r = ctx.vals[0];
+                            for (const [tag, lowerFn, size32, align32 ] of fieldMetas) {{
+                                const rem = ctx.storagePtr % align32;
+                                if (rem !== 0) {{ ctx.storagePtr += align32 - rem; }}
+
+                                const fieldPtr = ctx.storagePtr;
+                                ctx.vals = [r[tag]];
+                                lowerFn(ctx);
+
+                                ctx.storagePtr = Math.max(ctx.storagePtr, fieldPtr + size32);
+                            }}
+
+                            ctx.storagePtr = Math.max(ctx.storagePtr, originalPtr + recordSize32);
+
+                            const rem = ctx.storagePtr % recordAlign32;
+                            if (rem !== 0) {{
+                                ctx.storagePtr += recordAlign32 - rem;
+                            }}
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            Self::LowerFlatVariant => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_variant_fn = self.name();
+                let lower_u8_fn = render_args.require_intrinsic(Self::LowerFlatU8);
+                let lower_u16_fn = render_args.require_intrinsic(Self::LowerFlatU16);
+                let lower_u32_fn = render_args.require_intrinsic(Self::LowerFlatU32);
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_variant_fn}(meta) {{
+                        const {{ variantSize32, variantAlign32, variantPayloadOffset32, caseMetas }} = meta;
+
+                        let caseLookup = {{}};
+                        for (const [idx, meta] of caseMetas.entries()) {{
+                            let tag = meta[0];
+                            caseLookup[tag] = {{ discriminant: idx, meta }};
+                        }}
+
+                        return function {lower_flat_variant_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_variant_fn}()] args', {{ ctx }});
+
+                            const {{ tag, val }} = ctx.vals[0];
+                            const variantCase = caseLookup[tag];
+                            if (!variantCase) {{
+                                throw new Error(`missing tag [${{tag}}] (valid tags: ${{Object.keys(caseLookup)}})`);
+                            }}
+
+                            const [ _tag, lowerFn, caseSize32, caseAlign32, caseFlatCount ] = variantCase.meta;
+
+                            const originalPtr = ctx.storagePtr;
+                            ctx.vals = [variantCase.discriminant];
+                            let discLowerRes;
+                            if (caseMetas.length < 256) {{
+                                discLowerRes = {lower_u8_fn}(ctx);
+                            }} else if (caseMetas.length >= 256 && caseMetas.length < 65536) {{
+                                discLowerRes = {lower_u16_fn}(ctx);
+                            }} else if (caseMetas.length >= 65536 && caseMetas.length < 4_294_967_296) {{
+                                discLowerRes = {lower_u32_fn}(ctx);
+                            }} else {{
+                                throw new Error(`unsupported number of cases [${{caseMetas.length}}]`);
+                            }}
+
+                            const payloadOffsetPtr = originalPtr + variantPayloadOffset32;
+                            ctx.storagePtr = payloadOffsetPtr;
+                            ctx.vals = [val];
+                            if (lowerFn) {{ lowerFn(ctx); }}
+
+                            ctx.storagePtr = Math.max(ctx.storagePtr, originalPtr + variantSize32);
+
+                            const rem = ctx.storagePtr % variantAlign32;
+                            if (rem !== 0) {{ ctx.storagePtr += variantAlign32 - rem; }}
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatList => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_list_fn = self.name();
+                let lower_u32_fn = render_args.require_intrinsic(Self::LowerFlatU32);
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_list_fn}(meta) {{
+                        const {{
+                            elemLowerFn,
+                            knownLen,
+                            size32,
+                            align32,
+                            elemSize32,
+                            elemAlign32,
+                        }} = meta;
+
+                        if (!elemLowerFn) {{ throw new TypeError("missing/invalid element lower fn for list"); }}
+
+                        return function {lower_flat_list_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_list_fn}()] args', {{ ctx }});
+
+                            if (ctx.useDirectParams) {{
+                                if (ctx.params.length < 2) {{ throw new Error('insufficient params left to lower list'); }}
+                                const storagePtr = ctx.params[0] >>> 0;
+                                const elemCount = ctx.params[1];
+                                ctx.params = ctx.params.slice(2);
+
+                                const list = ctx.vals[0];
+                                if (!list) {{ throw new Error("missing direct param value"); }}
+
+                                const lowerCtx = {{
+                                    storagePtr,
+                                    memory: ctx.memory,
+                                    stringEncoding: ctx.stringEncoding,
+                                }};
+                                for (let idx = 0; idx < list.length; idx++) {{
+                                    const elemPtr = storagePtr + idx * elemSize32;
+                                    lowerCtx.storagePtr = elemPtr;
+                                    lowerCtx.vals = list.slice(idx, idx+1);
+                                    elemLowerFn(lowerCtx);
+                                    lowerCtx.storagePtr = Math.max(lowerCtx.storagePtr, elemPtr + elemSize32);
+                                }}
+                                ctx.storagePtr = lowerCtx.storagePtr;
+
+                                // TODO: implement parma-only known-length processing
+
+                                return;
+                            }}
+
+                            // TODO(fix): is it possible to get a vals that are a addr and length here from
+                            // a component lower?
+
+                            const elems = ctx.vals[0];
+                            if (knownLen === undefined) {{
+                                // unknown length
+                                if (!ctx.realloc) {{ throw new Error('missing realloc during flat string lower'); }}
+                                const dataPtr = ctx.realloc(0, 0, elemAlign32, elemSize32 * elems.length);
+
+                                ctx.vals[0] = dataPtr;
+                                {lower_u32_fn}(ctx);
+
+                                ctx.vals[0] = elems.length;
+                                {lower_u32_fn}(ctx);
+
+                                const origPtr = ctx.storagePtr;
+                                ctx.storagePtr = dataPtr;
+
+                                for (const [idx, elem] of elems.entries()) {{
+                                    const elemPtr = dataPtr + idx * elemSize32;
+                                    ctx.storagePtr = elemPtr;
+                                    ctx.vals = [elem];
+                                    elemLowerFn(ctx);
+                                    ctx.storagePtr = Math.max(ctx.storagePtr, elemPtr + elemSize32);
+                                }}
+
+                                ctx.storagePtr = origPtr;
+
+                            }} else {{
+                                // known length
+
+                                if (elems.length !== knownLen) {{
+                                    throw new TypeError(`invalid list input of length [${{elems.length}}], must be length [${{knownLen}}]`);
+                                }}
+
+                                const originalPtr = ctx.storagePtr;
+                                for (const [idx, elem] of elems.entries()) {{
+                                    const elemPtr = originalPtr + idx * elemSize32;
+                                    ctx.storagePtr = elemPtr;
+                                    ctx.vals = [elem];
+                                    elemLowerFn(ctx);
+                                    ctx.storagePtr = Math.max(ctx.storagePtr, elemPtr + elemSize32);
+                                }}
+                            }}
+
+                            // TODO(fix): special case for u8/u16/etc, we can do a direct copy
+
+                            const totalSizeBytes = elems.length * size32;
+                            if (ctx.storageLen !== undefined && totalSizeBytes > ctx.storageLen) {{
+                                throw new Error('not enough storage remaining for list flat lower');
+                            }}
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatMap => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_map_fn = self.name();
+                let lower_u32_fn = render_args.require_intrinsic(Self::LowerFlatU32);
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_map_fn}(meta) {{
+                        const {{
+                            keyLowerFn,
+                            valueLowerFn,
+                            entrySize32,
+                            entryAlign32,
+                            valueOffset32,
+                        }} = meta;
+
+                        return function {lower_flat_map_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_map_fn}()] args', {{ ctx }});
+                            const map = ctx.vals[0];
+                            if (!(map instanceof Map)) {{ throw new TypeError('expected a Map'); }}
+
+                            let dataPtr;
+                            let restorePtr;
+                            if (ctx.useDirectParams) {{
+                                if (ctx.params.length < 2) {{ throw new Error('insufficient params left to lower map'); }}
+                                dataPtr = ctx.params[0] >>> 0;
+                                const expectedLen = ctx.params[1];
+                                ctx.params = ctx.params.slice(2);
+                                if (expectedLen !== map.size) {{ throw new Error('map length does not match allocated storage'); }}
+                                restorePtr = ctx.storagePtr;
+                            }} else {{
+                                if (!ctx.realloc) {{ throw new Error('missing realloc during flat map lower'); }}
+                                dataPtr = ctx.realloc(0, 0, entryAlign32, entrySize32 * map.size);
+
+                                ctx.vals[0] = dataPtr;
+                                {lower_u32_fn}(ctx);
+                                ctx.vals[0] = map.size;
+                                {lower_u32_fn}(ctx);
+                                restorePtr = ctx.storagePtr;
+                            }}
+
+                            let idx = 0;
+                            for (const [key, value] of map) {{
+                                const entryPtr = dataPtr + idx * entrySize32;
+                                ctx.storagePtr = entryPtr;
+                                ctx.vals = [key];
+                                keyLowerFn(ctx);
+                                ctx.storagePtr = entryPtr + valueOffset32;
+                                ctx.vals = [value];
+                                valueLowerFn(ctx);
+                                idx++;
+                            }}
+                            ctx.storagePtr = restorePtr;
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatTuple => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_tuple_fn = self.name();
+
+                output.push_str(&format!(
+                    r#"
+                    function {lower_flat_tuple_fn}(meta) {{
+                        const {{ elemLowerMetas, size32: tupleSize32, align32: tupleAlign32 }} = meta;
+                        return function {lower_flat_tuple_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_tuple_fn}()] args', {{ ctx }});
+                            const originalPtr = ctx.storagePtr;
+                            const tuple = ctx.vals[0];
+                            for (const [idx, [ lowerFn, size32, align32 ]]  of elemLowerMetas.entries()) {{
+                                const rem = ctx.storagePtr % align32;
+                                if (rem !== 0) {{ ctx.storagePtr += align32 - rem; }}
+
+                                const elemPtr = ctx.storagePtr;
+                                ctx.vals = [tuple[idx]];
+                                lowerFn(ctx);
+                                ctx.storagePtr = Math.max(ctx.storagePtr, elemPtr + size32);
+                            }}
+
+                            ctx.storagePtr = Math.max(ctx.storagePtr, originalPtr + tupleSize32);
+
+                            const rem = ctx.storagePtr % tupleAlign32;
+                            if (rem !== 0) {{
+                                ctx.storagePtr += tupleAlign32 - rem;
+                            }}
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            Self::LowerFlatFlags => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_flags_fn = self.name();
+                let lower_value = if render_args.transpile_opts.flags_as_bigint {
+                    r#"
+                            const bigintFlags = ctx.vals[0];
+                            if (typeof bigintFlags !== 'bigint') {
+                                throw new TypeError('flags must be a bigint');
+                            }
+                            if (bigintFlags < 0n || (bigintFlags >> BigInt(names.length)) !== 0n) {
+                                throw new TypeError('flags have extraneous bits set');
+                            }
+                            const flagValue = Number(bigintFlags);
+                    "#
+                } else {
+                    r#"
+                            const flagObj = ctx.vals[0];
+                            let flagValue = 0;
+                            if (typeof flagObj === 'object' && flagObj !== null) {
+                                for (const [idx, name] of names.entries()) {
+                                    if (flagObj[name] === true) {
+                                        flagValue |= 1 << idx;
+                                    }
+                                }
+                            } else if (flagObj !== null && flagObj !== undefined) {
+                                throw new TypeError('only an object, undefined or null can be converted to flags');
+                            }
+                    "#
+                };
+
+                output.push_str(&format!(r#"
+                    function {lower_flat_flags_fn}(meta) {{
+                        const {{ names, size32, align32, intSizeBytes }} = meta;
+
+                        return function {lower_flat_flags_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_flags_fn}()] args', {{ ctx }});
+                            if (ctx.vals.length !== 1) {{ throw new Error('unexpected number of vals'); }}
+
+                            {lower_value}
+
+                            const rem = ctx.storagePtr % align32;
+                            if (rem !== 0) {{ ctx.storagePtr += (align32 - rem); }}
+
+                            const dv = new DataView(ctx.memory.buffer);
+                            if (intSizeBytes === 1) {{
+                                dv.setUint8(ctx.storagePtr, flagValue);
+                            }} else if (intSizeBytes === 2) {{
+                                dv.setUint16(ctx.storagePtr, flagValue, true);
+                            }} else if (intSizeBytes === 4) {{
+                                dv.setUint32(ctx.storagePtr, flagValue, true);
+                            }} else {{
+                                throw new Error(`unrecognized flag size [${{intSizeBytes}} bytes]`);
+                            }}
+
+                            ctx.storagePtr += intSizeBytes;
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LowerFlatEnum => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_enum_fn = self.name();
+                let lower_variant_fn = render_args.require_intrinsic(Self::LowerFlatVariant);
+
+                output.push_str(&format!(
+                    r#"
+                    function {lower_flat_enum_fn}(meta) {{
+                        const f = {lower_variant_fn}(meta);
+                        return function {lower_flat_enum_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_enum_fn}()] args', {{ ctx }});
+
+                            const v = ctx.vals[0];
+                            const isNotEnumObject = typeof v !== 'object'
+                                                      || Object.keys(v).length !== 2
+                                                      || !('tag' in v);
+                            if (isNotEnumObject) {{
+                                ctx.vals[0] = {{ tag: v }};
+                            }}
+
+                            f(ctx);
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            Self::LowerFlatOption => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_option_fn = self.name();
+                let lower_variant_fn = render_args.require_intrinsic(Self::LowerFlatVariant);
+
+                output.push_str(&format!(
+                    "
+                    function {lower_flat_option_fn}(meta) {{
+                        const {{ payloadMaybeNull }} = meta;
+                        const f = {lower_variant_fn}(meta);
+                        return function {lower_flat_option_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_option_fn}()] args', {{ ctx }});
+
+                            const v = ctx.vals[0];
+                            if (v === null || v === undefined) {{
+                                ctx.vals[0] = {{ tag: 'none' }};
+                            }} else if (payloadMaybeNull) {{
+                                const isNotOptionObject = typeof v !== 'object'
+                                                          || Object.keys(v).length !== 2
+                                                          || !('tag' in v)
+                                                          || !(v.tag === 'some' || v.tag === 'none')
+                                                          || !('val' in v);
+                                if (isNotOptionObject) {{
+                                    ctx.vals[0] = {{ tag: 'some', val: v }};
+                                }}
+                            }} else {{
+                                ctx.vals[0] = {{ tag: 'some', val: v }};
+                            }}
+
+                            f(ctx);
+                        }}
+                    }}
+                "
+                ));
+            }
+
+            Self::LowerFlatResult => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_result_fn = self.name();
+                let lower_variant_fn = render_args.require_intrinsic(Self::LowerFlatVariant);
+
+                output.push_str(&format!(
+                    r#"
+                    function {lower_flat_result_fn}(meta) {{
+                       const f = {lower_variant_fn}(meta);
+                       return function {lower_flat_result_fn}Inner(ctx) {{
+                           {debug_log_fn}('[{lower_flat_result_fn}()] args', {{ ctx }});
+
+                           const v = ctx.vals[0];
+                           const isNotResultObject = typeof v !== 'object'
+                                                     || Object.keys(v).length !== 2
+                                                     || !('tag' in v)
+                                                     || !('ok' === v.tag || 'err' === v.tag)
+                                                     || !('val' in v);
+                           if (isNotResultObject) {{
+                               ctx.vals[0] = {{ tag: 'ok', val: v }};
+                           }}
+
+                           f(ctx);
+                       }};
+                    }}
+                    "#
+                ));
+            }
+
+            Self::LowerFlatOwn => {
+                let lower_flat_own_fn = self.name();
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_u32_fn = render_args.require_intrinsic(Self::LowerFlatU32);
+
+                output.push_str(&format!(
+                    r#"
+                      function {lower_flat_own_fn}(meta) {{
+                          const {{ lowerFn, componentIdx, tableIdx }} = meta;
+
+                          return function {lower_flat_own_fn}Inner(ctx) {{
+                              {debug_log_fn}('[{lower_flat_own_fn}()] args', {{ ctx }});
+                              const {{ createFn }} = ctx;
+
+                              if (ctx.componentIdx !== componentIdx) {{
+                                  throw new Error(`component index mismatch (expected [${{componentIdx}}], lift called from [${{ctx.componentIdx}}])`);
+                              }}
+
+                              const obj = ctx.vals[0];
+                              if (obj === undefined || obj === null) {{ throw new Error('missing resource'); }}
+                              const handle = ctx.lowerResource
+                                  ? ctx.lowerResource(obj, tableIdx)
+                                  : lowerFn(obj);
+
+                              ctx.vals[0] = handle;
+                              {lower_u32_fn}(ctx);
+                          }};
+                      }}
+                    "#
+                ));
+            }
+
+            Self::LowerFlatBorrow => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_borrow_fn = self.name();
+                output.push_str(&format!(
+                    "
+                    function {lower_flat_borrow_fn}(ctx) {{
+                        {debug_log_fn}('[{lower_flat_borrow_fn}()] args', {{ ctx }});
+                        throw new Error('flat lower for borrowed resources is not supported!');
+                    }}
+                "
+                ));
+            }
+
+            Self::LowerFlatFuture => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_future_fn = self.name();
+                let lower_u32_fn = render_args.require_intrinsic(Self::LowerFlatU32);
+                let is_future_lowerable_object =
+                    render_args.require_intrinsic(AsyncFutureIntrinsic::IsFutureLowerableObject);
+                let symbol_cabi_rep = render_args.require_intrinsic(Intrinsic::SymbolResourceRep);
+                let global_future_map =
+                    render_args.require_intrinsic(AsyncFutureIntrinsic::GlobalFutureMap);
+                let get_or_create_async_state_fn =
+                    render_args.require_intrinsic(ComponentIntrinsic::GetOrCreateAsyncState);
+                let gen_future_host_inject_fn = render_args.require_intrinsic(
+                    Intrinsic::AsyncFuture(AsyncFutureIntrinsic::GenFutureHostInjectFn),
+                );
+                let nested_future_symbol = render_args.require_intrinsic(Intrinsic::AsyncFuture(
+                    AsyncFutureIntrinsic::NestedFutureSymbol,
+                ));
+                let create_future_fn =
+                    render_args.require_intrinsic(AsyncFutureIntrinsic::CreateFuture);
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lower_flat_future_fn}(meta) {{
+                        const {{
+                            componentIdx,
+                            futureTableIdx,
+                            elemMeta,
+                            futureNestingLevel,
+                        }} = meta;
+
+                        return function {lower_flat_future_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_future_fn}()] args', {{ ctx }});
+
+                            let future = ctx.vals[0];
+                            if (!future) {{ throw new Error("missing external future value"); }}
+
+                            if (!{is_future_lowerable_object}(future)) {{
+                                // A native async host function cannot return a thenable
+                                // without assimilating it. Preserve compatibility for a
+                                // single lowered layer by treating that result as already
+                                // settled; nested layers still arrive as FutureValue.
+                                future = Promise.resolve(future);
+                            }}
+
+                            let globalRep = future[{symbol_cabi_rep}];
+                            let waitableIdx;
+                            if (globalRep) {{
+                                const hostFuture = {global_future_map}.get(globalRep);
+                                if (!hostFuture) {{
+                                    throw new Error(`missing host future with global rep [${{globalRep}}]`);
+                                }}
+                                waitableIdx = hostFuture.getFutureEndWaitableIdx();
+                            }} else {{
+                                const cstate = {get_or_create_async_state_fn}(componentIdx);
+                                if (!cstate) {{
+                                    throw new Error(`missing async state for component [${{componentIdx}}]`);
+                                }}
+
+                                elemMeta.stringEncoding = 'utf8';
+
+                                let outermostReadEnd;
+                                // Lower one layer. A future-valued payload is lowered
+                                // recursively by elemMeta.lowerFn when this layer settles.
+                                let nestingLevel = 0;
+                                while (nestingLevel >= 0) {{
+                                    const {{ writeEnd, writeEndWaitableIdx, readEnd, readEndWaitableIdx }} = {create_future_fn}(cstate, {{
+                                        tableIdx: futureTableIdx,
+                                        elemMeta,
+                                    }});
+
+                                    const hostInjectFn = {gen_future_host_inject_fn}({{
+                                        promise: future,
+                                        stringEncoding: elemMeta.stringEncoding,
+                                        hostWriteEnd: writeEnd,
+                                    }});
+                                    readEnd.setHostInjectFn(hostInjectFn);
+
+                                    outermostReadEnd = readEnd;
+                                    future = {{
+                                        [{nested_future_symbol}]: true,
+                                        readEndWaitableIdx,
+                                        writeEndWaitableIdx,
+                                        futureTableIdx,
+                                        componentIdx,
+                                    }};
+
+                                    nestingLevel--;
+                                }}
+
+                                waitableIdx = outermostReadEnd.waitableIdx();
+                            }}
+
+                            // Write the idx of the waitable to memory (a waiting async task or caller)
+                            if (ctx.storagePtr) {{
+                                ctx.vals[0] = waitableIdx;
+                                {lower_u32_fn}(ctx);
+                            }}
+
+                            return waitableIdx;
+                        }}
+                    }}
+                "#
+                );
+            }
+
+            Self::LowerFlatStream => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_stream_fn = self.name();
+                let global_stream_map =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::GlobalStreamMap);
+                let external_stream_class =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::ExternalStreamClass);
+                let internal_stream_class =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::InternalStreamClass);
+                let is_stream_lowerable_object =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::IsStreamLowerableObject);
+                let symbol_cabi_rep = render_args.require_intrinsic(Intrinsic::SymbolResourceRep);
+                let get_or_create_async_state_fn =
+                    render_args.require_intrinsic(ComponentIntrinsic::GetOrCreateAsyncState);
+                let gen_read_fn_from_lowerable_stream_fn = render_args
+                    .require_intrinsic(AsyncStreamIntrinsic::GenReadFnFromLowerableStream);
+                let gen_stream_host_inject_fn = render_args.require_intrinsic(
+                    Intrinsic::AsyncStream(AsyncStreamIntrinsic::GenStreamHostInjectFn),
+                );
+                let lower_u32_fn = render_args.require_intrinsic(Self::LowerFlatU32);
+                let create_stream_fn =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::CreateStream);
+
+                output.push_str(&format!(
+                    r#"
+                    function {lower_flat_stream_fn}(meta) {{
+                        const {{
+                            componentIdx,
+                            streamTableIdx,
+                            elemMeta,
+                        }} = meta;
+
+                        return function {lower_flat_stream_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lower_flat_stream_fn}()] args', {{ ctx }});
+
+                            const stream = ctx.vals[0];
+                            if (!stream) {{ throw new Error("missing external stream value"); }}
+
+                            let globalRep;
+                            let waitableIdx;
+                            if (stream instanceof {external_stream_class}) {{
+                                globalRep = stream[{symbol_cabi_rep}];
+                                const internalStream = {global_stream_map}.get(globalRep);
+                                if (!internalStream || !(internalStream instanceof {internal_stream_class})) {{
+                                    throw new Error(`failed to find internal stream with rep [${{globalRep}}]`);
+                                }}
+                                waitableIdx = internalStream.readEnd().waitableIdx();
+                            }} else if ({is_stream_lowerable_object}(stream)) {{
+                                globalRep = stream[{symbol_cabi_rep}];
+
+                                if (globalRep) {{
+                                    const hostStream = {global_stream_map}.get(globalRep);
+                                    if (!hostStream) {{
+                                        throw new Error(`missing host stream with global rep [${{globalRep}}]`);
+                                    }}
+                                    waitableIdx = hostStream.getStreamEndWaitableIdx();
+                                }} else {{
+                                    const cstate = {get_or_create_async_state_fn}(componentIdx);
+                                    if (!cstate) {{
+                                        throw new Error(`missing async state for component [${{componentIdx}}]`);
+                                    }}
+
+                                    const {{ writeEnd, readEnd }} = {create_stream_fn}(cstate, {{
+                                        tableIdx: streamTableIdx,
+                                        elemMeta,
+                                    }});
+
+                                    const readFn = {gen_read_fn_from_lowerable_stream_fn}(stream);
+                                    const hostInjectFn = {gen_stream_host_inject_fn}({{
+                                        readFn,
+                                        hostWriteEnd: writeEnd,
+                                        readEnd,
+                                    }});
+                                    readEnd.setHostInjectFn(hostInjectFn);
+                                    readEnd.setHostDropFn(readFn.drop);
+
+                                    waitableIdx = readEnd.waitableIdx();
+                                }}
+                            }} else {{
+                                throw new Error('object does not conform to supported stream interfaces');
+                            }}
+
+                            // Write the idx of the waitable to memory (a waiting async task or caller)
+                            if (ctx.storagePtr) {{
+                                ctx.vals[0] = waitableIdx;
+                                {lower_u32_fn}(ctx);
+                            }}
+
+                            return waitableIdx;
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            // When a component-model level error context is lowered, it contains the global error-context
+            // and not a component-local handle value (as it did pre-lift).
+            //
+            // By lowering the error context into a given component (w/ a given error context table)
+            // we translate the global component model level rep into a local handle.
+            //
+            // see: `LiftIntrinsic::LiftFlatErrorContext`
+            Self::LowerFlatErrorContext => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lower_flat_error_context_fn = self.name();
+                let lower_u32_fn = render_args.require_intrinsic(Self::LowerFlatU32);
+                let create_local_handle_fn =
+                    render_args.require_intrinsic(ErrCtxIntrinsic::CreateLocalHandle);
+                let err_ctx_global_ref_count_add_fn =
+                    render_args.require_intrinsic(ErrCtxIntrinsic::GlobalRefCountAdd);
+                let get_or_create_async_state_fn =
+                    render_args.require_intrinsic(ComponentIntrinsic::GetOrCreateAsyncState);
+                let global_tbl =
+                    render_args.require_intrinsic(ErrCtxIntrinsic::ComponentGlobalTable);
+                let get_local_tbl_fn =
+                    render_args.require_intrinsic(ErrCtxIntrinsic::GetLocalTable);
+
+                // NOTE: at this point the error context has already been lowered into the appropriate
+                // place for us via error context transfer.
+                output.push_str(&format!(r#"
+                    function {lower_flat_error_context_fn}(errCtxTableIdx, ctx) {{
+                        {debug_log_fn}('[{lower_flat_error_context_fn}()] args', {{ errCtxTableIdx, ctx }});
+                        const {{ memory, realloc, vals, storagePtr, storageLen, componentIdx }} = ctx;
+
+                        const errCtxGlobalRep = vals[0];
+
+                        const globalTable = {global_tbl}.get();
+                        const globalErrCtx = globalTable.get(errCtxGlobalRep);
+
+                        // Clean up the previous error context, if necessary
+                        const prevComponentState = {get_or_create_async_state_fn}(globalErrCtx.componentIdx);
+                        const prevLocalErrCtx = prevComponentState.handles.get(globalErrCtx.waitableIdx);
+                        if (prevLocalErrCtx.refCount === 0) {{
+                            const removed = prevComponentState.remove(globalErrCtx.waitableIdx);
+                            if (!removed) {{
+                                throw new Error(`failed to remove err ctx [${{globalErrCtx.waitableIdx}}], component [${{globalErrCtx.componentIdx}}]`);
+                            }}
+                            const prevLocalErrCtxTable = {get_local_tbl_fn}(globalErrCtx.componentIdx, globalErrCtx.localTableIdx);
+                            prevLocalErrCtxTable.remove(globalErrCtx.localIdx)
+                        }}
+
+                        // Insert the error context into the destination tables
+                        const localErrCtxTable = {get_local_tbl_fn}(componentIdx, errCtxTableIdx, {{ upsert: true }});
+
+                        let handle = localErrCtxTable.get(componentIdx, errCtxTableIdx, );
+                        if (handle === undefined) {{
+                            const {{ waitableIdx, localIdx }} = {create_local_handle_fn}(
+                                componentIdx,
+                                localErrCtxTable,
+                                errCtxGlobalRep,
+                            );
+                            handle = waitableIdx;
+                        }} else {{
+                            const cstate = {get_or_create_async_state_fn}(componentIdx);
+                            const localErrCtx = cstate.handles.get(handle);
+                            localErrCtx.refCount += 1;
+                            localErrCtx.componentIdx = componentIdx;
+                            localErrCtx.localIdx = errCtx.localIdx;
+                            localErrCtx.localTableIdx = errCtxTableIdx;
+                        }}
+
+                        {err_ctx_global_ref_count_add_fn}(errCtxGlobalRep, -1);
+
+                        {lower_u32_fn}({{ memory, realloc, vals: [handle], storagePtr, storageLen, componentIdx }});
+                    }}
+                "#));
+            }
+        }
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "js-guest-bindgen"
+version = "0.1.0"
+license = "Apache-2.0 WITH LLVM-exception"
+categories = ["wasm"]
+keywords = ["webassembly", "wasm"]
+description = "Bindings for JS running inside a WebAssembly component on an embedded engine"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.102", default-features = false }
+heck = { version = "0.5.0", default-features = false }
+# a vendored copy of js-component-bindgen 2.16.0 with the guest memory hooks,
+# which are not in a release; see vendor/js-component-bindgen/README.md
+js-component-bindgen = { path = "vendor/js-component-bindgen" }
+# must match js-component-bindgen's versions
+wit-bindgen-core = { version = "0.62.0", default-features = false }
+wit-component = { version = "0.259.0" }
+wit-parser = { version = "0.259.0", default-features = false }
+
+[workspace]
+members = ["vendor/js-component-bindgen"]
+# each example has its own workspace, since guests target wasm
+exclude = ["examples"]

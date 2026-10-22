@@ -1,0 +1,33 @@
+package example:counter;
+
+interface logging {
+  resource logger {
+    constructor(prefix: string);
+    log: func(msg: string);
+  }
+}
+
+interface types {
+  use logging.{logger};
+
+  record stats {
+    name: string,
+    value: u32,
+  }
+
+  resource counter {
+    constructor(name: string, start: u32);
+    inc: func(by: u32) -> u32;
+    stats: func() -> stats;
+    merge: static func(a: borrow<counter>, b: borrow<counter>) -> counter;
+  }
+
+  describe: func(c: borrow<counter>) -> string;
+  log-to: func(c: borrow<counter>, l: borrow<logger>);
+  make-logger: func(prefix: string) -> logger;
+}
+
+world app {
+  import logging;
+  export types;
+}

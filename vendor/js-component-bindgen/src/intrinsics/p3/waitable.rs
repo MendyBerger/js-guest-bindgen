@@ -1,0 +1,723 @@
+//! Intrinsics that represent helpers that implement waitable sets
+
+use super::async_task::AsyncTaskIntrinsic;
+use crate::intrinsics::component::ComponentIntrinsic;
+use crate::intrinsics::p3::host::HostIntrinsic;
+use crate::intrinsics::{Intrinsic, RenderIntrinsicsArgs};
+use crate::source::Source;
+
+/// This enum contains intrinsics that enable waitable sets
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub enum WaitableIntrinsic {
+    /// The definition of the `WaitableSet` JS class
+    WaitableSetClass,
+
+    /// The definition of the `Waitable` JS class
+    WaitableClass,
+
+    /// Create a new waitable set
+    ///
+    /// Guest code uses this to create new waitable/pollable groups of events that can be waited on.
+    /// The waitable set is tied to the implicit current task
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type i32 = number;
+    /// function waitableSetNew(componentInstanceId: number): i32;
+    /// ```
+    ///
+    /// The function returns the index of the waitable set that was created, so it can be used later (e.g. waitableSetWait)
+    WaitableSetNew,
+
+    /// Wait on a given waitable
+    ///
+    /// Guest code uses this to wait on a waitable that has been already created
+    /// The waitable set index is relevant to the implicit current task.
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-waitable-setwait
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// function waitableSetWait(
+    ///     componentIdx: i32,
+    ///     isAsync: boolean,
+    ///     memory: i32,
+    ///     waitableSetRep: i32,
+    ///     resultPtr: i32
+    /// );
+    /// ```
+    ///
+    /// The results of the poll should be set in the provided pointer
+    WaitableSetWait,
+
+    /// Poll a given waitable set
+    ///
+    /// Guest code uses this builtin to poll whether a waitable set is finished or not,
+    /// yielding to other tasks while doing so.
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-waitable-setpoll
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type i32 = number;
+    /// function waitableSetPoll(
+    ///     componentIdx: i32,
+    ///     isAsync: boolean,
+    ///     memory: i32,
+    ///     waitableSetRep: i32,
+    ///     resultPtr: i32
+    /// );
+    /// ```
+    ///
+    /// The results of the poll should be set in the provided pointer
+    WaitableSetPoll,
+
+    /// Drop a given waitable set
+    ///
+    /// Guest code uses this builtin to remove the waitable set in it's entirety from a component instance's tables.
+    /// The component instance is known via the current task.
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-waitable-setdrop
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type i32 = number;
+    /// function waitableSetDrop(componentIdx: i32, waitableSetRep: i32);
+    /// ```
+    WaitableSetDrop,
+
+    /// JS helper function for removing a waitable set
+    RemoveWaitableSet,
+
+    /// Join a given waitable set
+    ///
+    /// Guest code uses this builtin to add a provided waitable to an existing waitable set.
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-waitablejoin
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// function waitableJoin(componentIdx: i32, waitableSetRep: i32, waitableRep: i32);
+    /// ```
+    ///
+    /// If the waitable set index is zero (an otherwise invalid table index), join should *remove* the given waitable from any sets
+    /// that it may be a part of (of which there should only be one).
+    WaitableJoin,
+}
+
+impl WaitableIntrinsic {
+    /// Retrieve global names for
+    pub fn get_global_names() -> impl IntoIterator<Item = &'static str> {
+        []
+    }
+
+    /// Get the name for the intrinsic
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::RemoveWaitableSet => "_removeWaitableSet",
+            Self::WaitableSetNew => "waitableSetNew",
+            Self::WaitableSetWait => "waitableSetWait",
+            Self::WaitableSetPoll => "waitableSetPoll",
+            Self::WaitableSetDrop => "waitableSetDrop",
+            Self::WaitableJoin => "waitableJoin",
+            Self::WaitableSetClass => "WaitableSet",
+            Self::WaitableClass => "Waitable",
+        }
+    }
+
+    /// Render an intrinsic to a string
+    pub fn render(&self, output: &mut Source, render_args: &RenderIntrinsicsArgs<'_>) {
+        match self {
+            Self::WaitableSetClass => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let waitable_set_class = render_args.require_intrinsic(Self::WaitableSetClass);
+                let async_event_code_enum =
+                    render_args.require_intrinsic(Intrinsic::AsyncEventCodeEnum);
+
+                output.push_str(&format!(
+                    r#"
+                    class {waitable_set_class} {{
+                        #componentIdx;
+                        #waitables = [];
+                        #pendingEvent = null;
+                        #waiting = 0;
+
+                        target;
+
+                        constructor(componentIdx) {{
+                            if (componentIdx === undefined) {{ throw new TypeError("missing/invalid component idx"); }}
+                            this.#componentIdx = componentIdx;
+                            this.target = `component [${{this.#componentIdx}}] waitable set`;
+                        }}
+
+                        componentIdx() {{ return this.#componentIdx; }}
+
+                        numWaitables() {{ return this.#waitables.length; }}
+                        numWaiting() {{ return this.#waiting; }}
+
+                        incrementNumWaiting(n) {{ this.#waiting += n ?? 1; }}
+                        decrementNumWaiting(n) {{ this.#waiting -= n ?? 1; }}
+
+                        targets() {{ return this.#waitables.map(w => w.target); }}
+
+                        setTarget(tgt) {{ this.target = tgt; }}
+
+                        shuffleWaitables() {{
+                            this.#waitables = this.#waitables
+                                .map(value => ({{ value, sort: Math.random() }}))
+                                .sort((a, b) => a.sort - b.sort)
+                                .map(({{ value }}) => value);
+                        }}
+
+                        removeWaitable(waitable) {{
+                            const existing = this.#waitables.find(w => w === waitable);
+                            if (!existing) {{ return undefined; }}
+                            this.#waitables = this.#waitables.filter(w => w !== waitable);
+                            return waitable;
+                        }}
+
+                        addWaitable(waitable) {{
+                            this.removeWaitable(waitable);
+                            this.#waitables.push(waitable);
+                        }}
+
+                        hasPendingEvent() {{
+                            {debug_log_fn}('[{waitable_set_class}#hasPendingEvent()] args', {{
+                                componentIdx: this.#componentIdx,
+                                waitableSet: this,
+                                waitableSetTargets: this.targets(),
+                            }});
+                            const waitable = this.#waitables.find(w => w.hasPendingEvent());
+                            return waitable !== undefined;
+                        }}
+
+                        getPendingEvent() {{
+                            {debug_log_fn}('[{waitable_set_class}#getPendingEvent()] args', {{
+                                componentIdx: this.#componentIdx,
+                                waitableSet: this,
+                            }});
+                            for (const waitable of this.#waitables) {{
+                                if (!waitable.hasPendingEvent()) {{ continue; }}
+                                const event = waitable.getPendingEvent();
+                                {debug_log_fn}('[{waitable_set_class}#getPendingEvent()] found pending event', {{
+                                    waitable,
+                                    event,
+                                }});
+                                return event;
+                            }}
+                            throw new Error('no waitables had a pending event');
+                        }}
+
+                        tryWait(opts) {{
+                            {debug_log_fn}('[{waitable_set_class}#tryWait()] args', {{ opts }});
+                            // TODO(threads): this task should be the thread
+                            const {{ readyFn, task, cancellable }} = opts;
+
+                            const isReady = () => {{
+                                const hasPendingEvent = this.hasPendingEvent();
+                                const ready = readyFn();
+                                return ready && hasPendingEvent;
+                            }};
+                            const finishWait = (keepGoing) => {{
+                                const event = keepGoing
+                                    ? this.getPendingEvent()
+                                    : {{
+                                    code: {async_event_code_enum}.TASK_CANCELLED,
+                                    payload0: 0,
+                                    payload1: 0,
+                                }};
+                                return event;
+                            }};
+
+                            if (task.deliverPendingCancel({{ cancellable }})) {{
+                                return finishWait(false);
+                            }}
+                            if (isReady()) {{ return finishWait(true); }}
+                            return null;
+                        }}
+
+                        waitUntil(opts) {{
+                            {debug_log_fn}('[{waitable_set_class}#waitUntil()] args', {{ opts }});
+                            const event = this.tryWait(opts);
+                            if (event !== null) {{ return event; }}
+
+                            const {{ readyFn, task, cancellable }} = opts;
+                            const isReady = () => readyFn() && this.hasPendingEvent();
+                            this.incrementNumWaiting();
+
+                            return task.suspendUntil({{ readyFn: isReady, cancellable }}).then(
+                                (keepGoing) => {{
+                                    // Resumed without an event because the task was torn down
+                                    // (e.g. the store trapped): that is not a cancellation the
+                                    // guest may observe and act on.
+                                    if (!keepGoing && task.isErrored()) {{
+                                        this.decrementNumWaiting();
+                                        throw task.isErrored();
+                                    }}
+                                    const readyEvent = keepGoing
+                                        ? this.getPendingEvent()
+                                        : {{
+                                        code: {async_event_code_enum}.TASK_CANCELLED,
+                                        payload0: 0,
+                                        payload1: 0,
+                                    }};
+                                    this.decrementNumWaiting();
+                                    return readyEvent;
+                                }},
+                                (err) => {{
+                                    this.decrementNumWaiting();
+                                    throw err;
+                                }},
+                            );
+                        }}
+
+                        waitUntilCallback(opts, onEvent) {{
+                            {debug_log_fn}('[{waitable_set_class}#waitUntilCallback()] args', {{ opts }});
+                            const event = this.tryWait(opts);
+                            if (event !== null) {{
+                                onEvent(event);
+                                return;
+                            }}
+
+                            const {{ readyFn, task, cancellable }} = opts;
+                            this.incrementNumWaiting();
+                            task.suspendUntilCallback({{
+                                readyFn: () => readyFn() && this.hasPendingEvent(),
+                                cancellable,
+                            }}, (keepGoing) => {{
+                                const resumedEvent = keepGoing
+                                    ? this.getPendingEvent()
+                                    : {{
+                                    code: {async_event_code_enum}.TASK_CANCELLED,
+                                    payload0: 0,
+                                    payload1: 0,
+                                }};
+                                this.decrementNumWaiting();
+                                onEvent(resumedEvent);
+                            }});
+                        }}
+
+                    }}
+                "#
+                ));
+            }
+
+            Self::WaitableClass => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let waitable_class = render_args.require_intrinsic(Self::WaitableClass);
+                let promise_with_resolvers_fn =
+                    render_args.require_intrinsic(Intrinsic::PromiseWithResolversPonyfill);
+
+                output.push_str(&format!(
+                    r#"
+                    class {waitable_class} {{
+                        #componentIdx;
+
+                        #pendingEventFn = null;
+
+                        #promise;
+                        #resolve;
+                        #reject;
+
+                        #waitableSet = null;
+
+                        #hasSyncWaiter = false;
+
+                        #idx = null; // to component-global waitables
+
+                        target;
+
+                        constructor(args) {{
+                            const {{ componentIdx, target }} = args;
+                            this.#componentIdx = componentIdx;
+                            this.target = args.target;
+                            this.#resetPromise();
+                        }}
+
+                        componentIdx() {{ return this.#componentIdx; }}
+                        isInSet() {{ return this.#waitableSet !== null; }}
+
+                        idx() {{ return this.#idx; }}
+                        setIdx(idx) {{
+                            if (idx === 0) {{ throw new Error("waitable idx cannot be zero"); }}
+                            this.#idx = idx;
+                        }}
+
+                        setTarget(tgt) {{ this.target = tgt; }}
+
+                        #resetPromise() {{
+                            const {{ promise, resolve, reject }} = {promise_with_resolvers_fn}()
+                            this.#promise = promise;
+                            this.#resolve = resolve;
+                            this.#reject = reject;
+                        }}
+
+                        resolve() {{ this.#resolve(); }}
+                        reject(err) {{ this.#reject(err); }}
+                        promise() {{ return this.#promise; }}
+
+                        hasPendingEvent() {{
+                            // {debug_log_fn}('[{waitable_class}#hasPendingEvent()]', {{
+                            //     componentIdx: this.#componentIdx,
+                            //     waitable: this,
+                            //     waitableSet: this.#waitableSet,
+                            //     hasPendingEvent: this.#pendingEventFn !== null,
+                            // }});
+                            return this.#pendingEventFn !== null;
+                        }}
+
+                        setPendingEvent(fn) {{
+                            {debug_log_fn}('[{waitable_class}#setPendingEvent()] args', {{
+                                waitable: this,
+                                inSet: this.#waitableSet,
+                            }});
+                            this.#pendingEventFn = fn;
+                        }}
+
+                        getPendingEvent() {{
+                            {debug_log_fn}('[{waitable_class}#getPendingEvent()] args', {{
+                                waitable: this,
+                                inSet: this.#waitableSet,
+                                hasPendingEvent: this.#pendingEventFn !== null,
+                            }});
+                            if (this.#pendingEventFn === null) {{ return null; }}
+                            const eventFn = this.#pendingEventFn;
+                            this.#pendingEventFn = null;
+                            const e = eventFn();
+                            this.#resetPromise();
+                            return e;
+                        }}
+
+                        join(waitableSet) {{
+                            {debug_log_fn}('[{waitable_class}#join()] args', {{
+                                waitable: this,
+                                waitableSet: waitableSet,
+                                isRemoval: waitableSet === null,
+                            }});
+
+                            if (this.#waitableSet === undefined) {{
+                                throw new TypeError('waitable set must be not be undefined');
+                            }}
+
+                            if (this.#waitableSet) {{
+                                this.#waitableSet.removeWaitable(this);
+                            }}
+
+                            this.#waitableSet = waitableSet;
+
+                            if (waitableSet) {{
+                                this.#waitableSet.addWaitable(this);
+                            }}
+                        }}
+
+                        drop() {{
+                            {debug_log_fn}('[{waitable_class}#drop()] args', {{
+                                componentIdx: this.#componentIdx,
+                                waitable: this,
+                            }});
+                            this.join(null);
+                        }}
+
+                        async waitForPendingEvent(args) {{
+                            const {{ cstate }} = args;
+                            if (!cstate) {{ throw new TypeError('missing component state'); }}
+
+                            if (this.#waitableSet !== null || this.#hasSyncWaiter) {{
+                                throw new Error("waitable is already in a set/has a sync waiter");
+                            }}
+                            this.#hasSyncWaiter = true;
+                            await cstate.waitUntil({{
+                                cancellable: false,
+                                readyFn: () => this.hasPendingEvent(),
+                            }});
+                            this.#hasSyncWaiter = false;
+                        }}
+
+                    }}
+                "#
+                ));
+            }
+
+            Self::WaitableSetNew => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let waitable_set_class = render_args.require_intrinsic(Self::WaitableSetClass);
+                let waitable_set_new_fn = render_args.require_intrinsic(Self::WaitableSetNew);
+                output.push_str(&format!(r#"
+                    function {waitable_set_new_fn}(componentIdx) {{
+                        {debug_log_fn}('[{waitable_set_new_fn}()] args', {{ componentIdx }});
+
+                        const state = {get_or_create_async_state_fn}(componentIdx);
+                        if (!state) {{throw new Error(`missing async state for component idx [${{componentIdx}}]`); }}
+
+                        const wset = new {waitable_set_class}(componentIdx);
+                        const rep = state.handles.insert(wset);
+                        if (typeof rep !== 'number') {{ throw new Error(`invalid/missing waitable set rep [${{rep}}]`); }}
+
+                        {debug_log_fn}('[{waitable_set_new_fn}()] created waitable set', {{ componentIdx, rep }});
+                        return rep;
+                    }}
+                "#));
+            }
+
+            Self::WaitableSetWait => {
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let waitable_set_wait_fn = render_args.require_intrinsic(Self::WaitableSetWait);
+                let current_task_get_fn = render_args
+                    .require_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+                let store_event_in_component_memory_fn = render_args
+                    .require_intrinsic(Intrinsic::Host(HostIntrinsic::StoreEventInComponentMemory));
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let waitable_set_class = render_args.require_intrinsic(Self::WaitableSetClass);
+
+                output.push_str(&format!(r#"
+                    function {waitable_set_wait_fn}(ctx, waitableSetRep, resultPtr, syncOnly = false) {{
+                        {debug_log_fn}('[{waitable_set_wait_fn}()] args', {{ ctx, waitableSetRep, resultPtr }});
+                        const {{
+                            componentIdx,
+                            isAsync,
+                            memoryIdx,
+                            getMemoryFn,
+                        }} = ctx;
+
+                        const taskMeta = {current_task_get_fn}(componentIdx);
+                        if (!taskMeta) {{ throw Error('invalid/missing async task meta'); }}
+
+                        const task = taskMeta.task;
+                        if (!task) {{ throw Error('invalid/missing async task'); }}
+
+                        if (task.componentIdx() !== componentIdx) {{
+                            throw Error(`task component [${{task.componentIdx}}] !== executing component [${{componentIdx}}]`);
+                        }}
+
+                        const memory = getMemoryFn();
+
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+                        const wset = cstate.handles.get(waitableSetRep);
+                        if (!(wset instanceof {waitable_set_class})) {{
+                            throw new {runtime_error_class}(`non-waitable set returned from component state handles @ [${{waitableSetRep}}]`);
+                        }}
+
+                        const storeEvent = (event) => {store_event_in_component_memory_fn}({{
+                                memory,
+                                ptr: resultPtr,
+                                event,
+                                componentIdx,
+                                task,
+                                memoryIdx,
+                            }});
+                        // Built-in waits never deliver cancellation. Only the
+                        // callback event loop's wait is cancellable.
+                        const waitOpts = {{ readyFn: () => true, task, cancellable: false }};
+                        const event = syncOnly ? wset.tryWait(waitOpts) : wset.waitUntil(waitOpts);
+                        if (event === null) {{ return -1; }}
+                        if (event && typeof event.then === 'function') {{
+                            return event.then(storeEvent);
+                        }}
+                        return storeEvent(event);
+                    }}
+                "#));
+            }
+
+            Self::WaitableSetPoll => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let waitable_set_poll_fn = render_args.require_intrinsic(Self::WaitableSetPoll);
+                let current_task_get_fn = render_args
+                    .require_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let store_event_in_component_memory_fn =
+                    render_args.require_intrinsic(HostIntrinsic::StoreEventInComponentMemory);
+                let async_event_code_enum =
+                    render_args.require_intrinsic(Intrinsic::AsyncEventCodeEnum);
+                let waitable_set_class = render_args.require_intrinsic(Self::WaitableSetClass);
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                output.push_str(&format!(r#"
+                    function {waitable_set_poll_fn}(ctx, waitableSetRep, resultPtr) {{
+                        const {{ componentIdx, memoryIdx, getMemoryFn, isAsync }} = ctx;
+                        {debug_log_fn}('[{waitable_set_poll_fn}()] args', {{
+                            componentIdx,
+                            memoryIdx,
+                            waitableSetRep,
+                            resultPtr,
+                        }});
+
+                        const taskMeta = {current_task_get_fn}(componentIdx);
+                        if (!taskMeta) {{ throw Error('invalid/missing current task meta'); }}
+                        if (taskMeta.componentIdx !== componentIdx) {{
+                            throw Error('task component idx [' + task.componentIdx + '] != component instance ID [' + componentIdx + ']');
+                        }}
+
+                        const task = taskMeta.task;
+                        if (!task) {{ throw Error('invalid/missing async task in task meta'); }}
+
+                        if (task.componentIdx() !== componentIdx) {{
+                            throw Error(`task component idx [${{task.componentIdx()}}] does not match generated [${{componentIdx}}]`);
+                        }}
+
+                        const cstate = {get_or_create_async_state_fn}(task.componentIdx());
+                        // (the index must name a waitable set, as for `waitable-set.wait`)
+                        const wset = waitableSetRep === 0 ? undefined : cstate.handles.get(waitableSetRep);
+                        if (!(wset instanceof {waitable_set_class})) {{
+                            throw new {runtime_error_class}(`unknown handle index ${{waitableSetRep}}`);
+                        }}
+
+                        let event;
+                        if (!wset.hasPendingEvent()) {{
+                            {debug_log_fn}('[{waitable_set_poll_fn}()] no pending event', {{
+                                componentIdx,
+                                waitableSetRep,
+                            }});
+                            event = {{ code: {async_event_code_enum}.NONE, payload0: 0, payload1: 0 }};
+                        }} else {{
+                            {debug_log_fn}('[{waitable_set_poll_fn}()] retrieving waiting pending event', {{
+                                componentIdx,
+                                waitableSetRep,
+                            }});
+                            event = wset.getPendingEvent();
+                        }}
+
+                        const eventCode = {store_event_in_component_memory_fn}({{
+                            event,
+                            ptr: resultPtr,
+                            memory: getMemoryFn(),
+                            componentIdx,
+                            task,
+                            memoryIdx,
+                        }});
+
+                        return eventCode;
+                    }}
+                "#));
+            }
+
+            Self::WaitableSetDrop => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let waitable_set_drop_fn = render_args.require_intrinsic(Self::WaitableSetDrop);
+                let current_task_get_fn = render_args
+                    .require_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let remove_waitable_set_fn = render_args.require_intrinsic(Self::RemoveWaitableSet);
+                output.push_str(&format!("
+                    function {waitable_set_drop_fn}(componentIdx, waitableSetRep) {{
+                        {debug_log_fn}('[{waitable_set_drop_fn}()] args', {{ componentIdx, waitableSetRep }});
+                        const task = {current_task_get_fn}(componentIdx);
+
+                        if (!task) {{ throw new Error('invalid/missing async task'); }}
+                        if (task.componentIdx !== componentIdx) {{
+                            throw Error('task component idx [' + task.componentIdx + '] != component instance ID [' + componentIdx + ']');
+                        }}
+
+                        const state = {get_or_create_async_state_fn}(componentIdx);
+                        if (!state.mayLeave) {{ throw new Error('component instance is not marked as may leave, cannot be cancelled'); }}
+
+                        {remove_waitable_set_fn}({{ state, waitableSetRep }});
+                    }}
+                "));
+            }
+
+            Self::RemoveWaitableSet => {
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let remove_waitable_set_fn = render_args.require_intrinsic(Self::RemoveWaitableSet);
+                output.push_str(&format!(r#"
+                    function {remove_waitable_set_fn}(args) {{
+                        {debug_log_fn}('[{remove_waitable_set_fn}()] args', args);
+                        const {{ state, waitableSetRep }} = args;
+                        if (!state) {{ throw new TypeError("missing component state"); }}
+                        if (!waitableSetRep) {{ throw new TypeError("missing component waitableSetRep"); }}
+
+                        const ws = state.handles.get(waitableSetRep);
+                        if (!ws) {{
+                            throw new {runtime_error_class}('cannot remove waitable set: no set present with rep [' + waitableSetRep + ']');
+                        }}
+                        if (ws.hasPendingEvent()) {{
+                            throw new Error('waitable set cannot be removed with pending items remaining');
+                        }}
+
+                        const waitableSet = state.handles.get(waitableSetRep);
+                        if (ws.numWaitables() > 0) {{
+                            throw new Error('waitable set still contains waitables');
+                        }}
+                        if (ws.numWaiting() > 0) {{
+                            throw new Error('cannot drop waitable set with waiters');
+                        }}
+
+                        state.handles.remove(waitableSetRep);
+                    }}
+                "#));
+            }
+
+            Self::WaitableJoin => {
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let waitable_join_fn = render_args.require_intrinsic(Self::WaitableJoin);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                output.push_str(&format!(r#"
+                    function {waitable_join_fn}(componentIdx, waitableRep, waitableSetRep) {{
+                        {debug_log_fn}('[{waitable_join_fn}()] args', {{
+                            componentIdx,
+                            waitableSetRep,
+                            isRemoval: waitableSetRep === 0,
+                            waitableRep,
+                        }});
+
+                        const state = {get_or_create_async_state_fn}(componentIdx);
+                        if (!state) {{
+                           throw new Error(`invalid/missing async state for component instance [${{componentIdx}}]`);
+                        }}
+
+                        if (!state.mayLeave) {{
+                            throw new Error('component instance is not marked as may leave, cannot join waitable');
+                        }}
+
+                        const waitableObj = state.handles.get(waitableRep);
+                        if (!waitableObj) {{
+                            throw new Error(`missing waitable obj (rep [${{waitableRep}}]), component idx [${{componentIdx}}])`);
+                        }}
+                        const waitable = waitableObj.getWaitable ? waitableObj.getWaitable() : waitableObj;
+                        if (!waitable.join) {{
+                            throw new Error("invalid waitable object, does not have join()");
+                        }}
+
+                        const waitableSet = waitableSetRep === 0 ? null : state.handles.get(waitableSetRep);
+                        if (waitableSetRep !== 0 && !waitableSet) {{
+                            throw new {runtime_error_class}(`missing waitable set [${{waitableSetRep}}] in component idx [${{componentIdx}}]`);
+                        }}
+
+                        waitable.join(waitableSet);
+                    }}
+                "#));
+            }
+        }
+    }
+}

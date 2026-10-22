@@ -1,0 +1,40 @@
+# FORK(js-guest-bindgen): a copy of js-component-bindgen 2.16.0 from crates.io
+# with the guest memory hooks added. Every change to the original sources is
+# marked with a `FORK(js-guest-bindgen)` comment. The dependencies are those of
+# the published crate, plus `wat` for its unit tests.
+
+[package]
+name = "js-component-bindgen"
+version = "2.16.0"
+authors = [
+  "Alex Crichton <alex@alexcrichton.com>",
+  "Guy Bedford <gbedford@fastly.com>",
+]
+license = "Apache-2.0 WITH LLVM-exception"
+description = "JS component bindgen for transpiling WebAssembly components into JavaScript"
+homepage = "https://github.com/bytecodealliance/jco/tree/main/crates/js-component-bindgen"
+repository = "https://github.com/bytecodealliance/jco"
+readme = "README.md"
+publish = false
+edition = "2024"
+
+[features]
+default = ["transpile-bindgen"]
+transpile-bindgen = []
+
+[dependencies]
+anyhow = { version = "1.0.102", default-features = false }
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+bon = { version = "3.9.1", default-features = false, features = ["std", "alloc"] }
+heck = { version = "0.5.0", default-features = false }
+log = { version = "0.4.29", default-features = false }
+semver = { version = "1.0.27", default-features = false }
+wasm-encoder = { version = "0.259.0", default-features = false, features = ["wasmparser"] }
+wasmparser = { version = "0.259.0", default-features = false, features = ["features", "component-model"] }
+wasmtime-environ = { version = "49.0.0", features = ["component-model", "compile", "anyhow"] }
+wit-bindgen-core = { version = "0.62.0", default-features = false }
+wit-component = { version = "0.259.0", features = ["dummy-module"] }
+wit-parser = { version = "0.259.0", default-features = false }
+
+[dev-dependencies]
+wat = { version = "1.259.0", default-features = false, features = ["component-model"] }

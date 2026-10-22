@@ -1,0 +1,2809 @@
+//! Intrinsics that represent helpers that enable Stream integration
+
+use crate::{
+    intrinsics::{Intrinsic, RenderIntrinsicsArgs, component::ComponentIntrinsic},
+    source::Source,
+};
+
+use super::{
+    CANNOT_LIFT_STREAM_IN_WAITABLE_SET, CANNOT_START_CONCURRENT_OPERATION,
+    async_task::AsyncTaskIntrinsic,
+};
+
+/// This enum contains intrinsics that enable Stream
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub enum AsyncStreamIntrinsic {
+    /// Global that stores streams
+    ///
+    /// ```ts
+    /// type i32 = number;
+    /// type StreamEnd = StreamWritableEndClass | StreamReadableEndClass;
+    /// type GlobalStreamMap<T> = Map<i32, StreamEnd>;
+    /// ```
+    GlobalStreamMap,
+
+    /// Map of stream tables to component indices
+    GlobalStreamTableMap,
+
+    /// Create an internal stream
+    CreateStream,
+
+    /// Retrieve a stream end from its component or stream table
+    GetStreamEnd,
+
+    /// Add a stream end to a stream table and its component's waitable table
+    AddStreamEndToTable,
+
+    /// Delete a stream end from its component and stream tables
+    DeleteStreamEnd,
+
+    /// Remove a stream end from a stream table and its component's waitable table
+    RemoveStreamEndFromTable,
+
+    /// The definition of the `StreamEnd` JS superclass
+    StreamEndClass,
+
+    /// The definition of the `InternalStream` JS class (which inherits from the `StreamEnd` superclass)
+    ///
+    /// This class serves as a shared implementation used by writable and readable ends,
+    /// that is meant to be used internally to generated code.
+    InternalStreamClass,
+
+    /// The definition of the `StreamReadableEnd` JS class
+    StreamReadableEndClass,
+
+    /// The definition of the `StreamWritableEnd` JS class
+    StreamWritableEndClass,
+
+    /// The definition of the `HostStream` JS class
+    ///
+    /// This class serves as an implementation for top level host-managed streams,
+    /// internal to the bindgen generated logic.
+    ///
+    /// External code is no expected to work in terms of `HostStream`, but rather deal with `Stream`s
+    ///
+    HostStreamClass,
+
+    /// The definition of the `Stream` JS class for use with external clients/SDKs
+    ///
+    /// This class serves as an user-facing implementation of a Preview3 `stream`.
+    /// Usually this class is created via `HostStream#createStream()`.
+    ///
+    ExternalStreamClass,
+
+    /// The definition of the pending value queue used by host stream injection
+    PendingValueQueueClass,
+
+    /// Create a new stream
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-streamfuturenew
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type u32 = number; // >= 0
+    /// type u64 = bigint; // >= 0
+    /// function streamNew(typeRep: u32): u64;
+    /// ```
+    StreamNew,
+
+    /// Create a new stream during a lift (`Instruction::StreamLift`).
+    ///
+    /// This is distinct from plain stream creation, because we are provided more information,
+    /// particularly the relevant types to teh stream and lift/lower fns for the stream.
+    ///
+    /// ```ts
+    /// type Ctx = {
+    ///     componentIdx: number,
+    ///     elemMeta: object,
+    /// }
+    /// function streamNewFromLift(ctx: Ctx);
+    /// ```
+    ///
+    StreamNewFromLift,
+
+    /// Read from a stream
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-streamfuturereadwrite
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type i32 = number;
+    /// type u32 = number; // >=0
+    /// type i64 = bigint;
+    /// type StringEncoding = 'utf8' | 'utf16' | 'compact-utf16'; // see wasmtime_environ::StringEncoding
+    ///
+    /// function streamRead(
+    ///     componentIdx: i32,
+    ///     memory: i32,
+    ///     realloc: i32,
+    ///     encoding: StringEncoding,
+    ///     isAsync: bool,
+    ///     typeRep: u32,
+    ///     streamRep: u32,
+    ///     ptr: u32,
+    ///     count:u322
+    /// ): i64;
+    /// ```
+    StreamRead,
+
+    /// Write to a stream
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-streamfuturereadwrite
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type i32 = number;
+    /// type u32 = number; // >=0
+    /// type i64 = bigint;
+    /// type StringEncoding = 'utf8' | 'utf16' | 'compact-utf16'; // see wasmtime_environ::StringEncoding
+    ///
+    /// function streamWrite(
+    ///     componentIdx: i32,
+    ///     memory: i32,
+    ///     realloc: i32,
+    ///     encoding: StringEncoding,
+    ///     isAsync: bool,
+    ///     typeRep: u32,
+    ///     streamRep: u32,
+    ///     ptr: u32,
+    ///     count:u322
+    /// ): i64;
+    /// ```
+    StreamWrite,
+
+    /// Cancel a read to a stream
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-streamfuturecancel-readread
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type u32 = number; // >=0
+    /// type u64 = bigint; // >= 0
+    ///
+    /// function streamCancelRead(streamRep: u32, isAsync: boolean, readerRep: u32): u64;
+    /// ```
+    StreamCancelRead,
+
+    /// Cancel a write to a stream
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-streamfuturecancel-writewrite
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type u32 = number; // >=0
+    /// type u64 = bigint; // >= 0
+    ///
+    /// function streamCancelWrite(streamRep: u32, isAsync: boolean, writerRep: u32): u64;
+    /// ```
+    StreamCancelWrite,
+
+    /// Drop a the readable end of a Stream
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-streamfuturedrop-readablewritable
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type u32 = number; // >=0
+    ///
+    /// function streamDropReadable(streamRep: u32, readerRep: u32): bool;
+    /// ```
+    StreamDropReadable,
+
+    /// Drop a the writable end of a Stream
+    ///
+    /// See: https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-streamfuturedrop-readablewritable
+    ///
+    /// # Intrinsic implementation function
+    ///
+    /// The function that implements this intrinsic has the following definition:
+    ///
+    /// ```ts
+    /// type u32 = number; // >=0
+    ///
+    /// function streamDropWritable(streamRep: u32, writerRep: u32): bool;
+    /// ```
+    StreamDropWritable,
+
+    /// Transfer a given stream from one component to another
+    ///
+    /// Note that all arguments for a stream transfer are provided via arguments at runtime,
+    /// and is generally called from the *guest* component (or at least the guest component idx is
+    /// discernable via the current task).
+    ///
+    /// ```ts
+    /// type u32 = number;
+    ///
+    /// function streamTransfer(srcComponentIdx: u32, srcTableIdx: u32, destTableIdx: u32): bool;
+    /// ```
+    StreamTransfer,
+
+    /// Function to check whether a JS object can be used as a stream
+    IsStreamLowerableObject,
+
+    /// Function that generates a host injection function for external streams
+    ///
+    /// This is usually used when lowering external streams' readable ends into a component,
+    /// and the generated function is generally called right when a component attempts to read
+    /// (in doing so, "injecting" a write before the component read).
+    GenStreamHostInjectFn,
+
+    /// Function that generates a function (the "read function") lowerable stream object
+    GenReadFnFromLowerableStream,
+}
+
+impl AsyncStreamIntrinsic {
+    /// Retrieve global names for this intrinsic
+    pub fn get_global_names() -> impl IntoIterator<Item = &'static str> {
+        // Every intrinsic lives in the generated module's scope, so each of
+        // their names must be reserved: an export named e.g. `stream-read`
+        // would otherwise be bound as a local `streamRead` that shadows the
+        // intrinsic the trampolines call.
+        [
+            Self::GlobalStreamMap.name(),
+            Self::GlobalStreamTableMap.name(),
+            Self::CreateStream.name(),
+            Self::GetStreamEnd.name(),
+            Self::AddStreamEndToTable.name(),
+            Self::DeleteStreamEnd.name(),
+            Self::RemoveStreamEndFromTable.name(),
+            Self::StreamEndClass.name(),
+            Self::InternalStreamClass.name(),
+            Self::StreamWritableEndClass.name(),
+            Self::StreamReadableEndClass.name(),
+            Self::HostStreamClass.name(),
+            Self::ExternalStreamClass.name(),
+            Self::PendingValueQueueClass.name(),
+            Self::StreamNew.name(),
+            Self::StreamNewFromLift.name(),
+            Self::StreamRead.name(),
+            Self::StreamWrite.name(),
+            Self::StreamDropReadable.name(),
+            Self::StreamDropWritable.name(),
+            Self::StreamTransfer.name(),
+            Self::StreamCancelRead.name(),
+            Self::StreamCancelWrite.name(),
+            Self::IsStreamLowerableObject.name(),
+            Self::GenStreamHostInjectFn.name(),
+            Self::GenReadFnFromLowerableStream.name(),
+        ]
+    }
+
+    /// Get the name for the intrinsic
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::GlobalStreamMap => "STREAMS",
+            Self::GlobalStreamTableMap => "STREAM_TABLES",
+            Self::CreateStream => "createStream",
+            Self::GetStreamEnd => "getStreamEnd",
+            Self::AddStreamEndToTable => "addStreamEndToTable",
+            Self::DeleteStreamEnd => "deleteStreamEnd",
+            Self::RemoveStreamEndFromTable => "removeStreamEndFromTable",
+            Self::StreamEndClass => "StreamEnd",
+            Self::InternalStreamClass => "InternalStream",
+            Self::StreamWritableEndClass => "StreamWritableEnd",
+            Self::StreamReadableEndClass => "StreamReadableEnd",
+            Self::HostStreamClass => "HostStream",
+            Self::ExternalStreamClass => "Stream",
+            Self::PendingValueQueueClass => "PendingValueQueue",
+            Self::StreamNew => "streamNew",
+            Self::StreamNewFromLift => "streamNewFromLift",
+            Self::StreamRead => "streamRead",
+            Self::StreamWrite => "streamWrite",
+            Self::StreamDropReadable => "streamDropReadable",
+            Self::StreamDropWritable => "streamDropWritable",
+            Self::StreamTransfer => "streamTransfer",
+            Self::StreamCancelRead => "streamCancelRead",
+            Self::StreamCancelWrite => "streamCancelWrite",
+            Self::IsStreamLowerableObject => "_isStreamLowerableObject",
+            Self::GenStreamHostInjectFn => "_genStreamHostInjectFn",
+            Self::GenReadFnFromLowerableStream => "_genReadFnFromLowerableStream",
+        }
+    }
+
+    /// Render an intrinsic to a string
+    pub fn render(&self, output: &mut Source, render_args: &RenderIntrinsicsArgs<'_>) {
+        match self {
+            Self::AddStreamEndToTable => {
+                let add_stream_end_to_table_fn = self.name();
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let global_stream_table_map =
+                    render_args.require_intrinsic(Self::GlobalStreamTableMap);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                output.push_str(&format!(
+                    r#"
+                    function {add_stream_end_to_table_fn}(args) {{
+                        {debug_log_fn}('[{add_stream_end_to_table_fn}()] args', args);
+                        const {{ tableIdx, streamEnd }} = args;
+                        if (typeof streamEnd === 'number') {{ throw new Error("INSERTING BAD STREAMEND"); }}
+
+                        let {{ table, componentIdx }} = {global_stream_table_map}[tableIdx];
+                        if (componentIdx === undefined || !table) {{
+                            throw new Error(`invalid global stream table state for table [${{tableIdx}}]`);
+                        }}
+
+                        const handle = table.insert(streamEnd);
+                        streamEnd.setHandle(handle);
+                        streamEnd.setStreamTableIdx(tableIdx);
+
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+                        const waitableIdx = cstate.handles.insert(streamEnd);
+                        streamEnd.setWaitableIdx(waitableIdx);
+
+                        {debug_log_fn}('[{add_stream_end_to_table_fn}()] added stream end', {{
+                            tableIdx,
+                            table,
+                            handle,
+                            streamEnd,
+                            destComponentIdx: componentIdx,
+                        }});
+
+                        return {{ handle, waitableIdx }};
+                    }}
+
+                    "#,
+                ));
+            }
+
+            Self::CreateStream => {
+                let create_stream_fn = self.name();
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let internal_stream_class =
+                    render_args.require_intrinsic(Self::InternalStreamClass);
+                let global_stream_map = render_args.require_intrinsic(Self::GlobalStreamMap);
+                let global_stream_table_map =
+                    render_args.require_intrinsic(Self::GlobalStreamTableMap);
+
+                output.push_str(&format!(
+                    r#"
+                    function {create_stream_fn}(cstate, args) {{
+                        {debug_log_fn}('[{create_stream_fn}()] args', args);
+                        const {{ tableIdx, elemMeta, hostInjectFn }} = args;
+                        if (tableIdx === undefined) {{ throw new Error("missing table idx while adding stream"); }}
+                        if (elemMeta === undefined) {{ throw new Error("missing element metadata while adding stream"); }}
+
+                        const {{ table: localStreamTable, componentIdx }} = {global_stream_table_map}[tableIdx];
+                        if (!localStreamTable) {{
+                            throw new Error(`missing global stream table lookup for table [${{tableIdx}}] while creating stream`);
+                        }}
+                        if (componentIdx !== cstate.componentIdx()) {{
+                            throw new Error('component idx mismatch while creating stream');
+                        }}
+
+                        const readWaitable = cstate.createWaitable();
+                        const writeWaitable = cstate.createWaitable();
+
+                        const stream = new {internal_stream_class}({{
+                            tableIdx,
+                            elemMeta,
+                            readWaitable,
+                            writeWaitable,
+                            hostInjectFn,
+                        }});
+                        stream.setGlobalStreamMapRep({global_stream_map}.insert(stream));
+
+                        const readEnd = stream.readEnd();
+                        readEnd.setWaitableIdx(cstate.handles.insert(readEnd));
+                        readEnd.setHandle(localStreamTable.insert(readEnd));
+                        if (readEnd.streamTableIdx() !== tableIdx) {{ throw new Error("unexpectedly mismatched stream table"); }}
+
+                        const readEndWaitableIdx = readEnd.waitableIdx();
+                        const readEndHandle = readEnd.handle();
+                        readWaitable.setTarget(`waitable for read end (waitable [${{readEndWaitableIdx}}])`);
+                        readEnd.setTarget(`stream read end (waitable [${{readEndWaitableIdx}}])`);
+
+                        const writeEnd = stream.writeEnd();
+                        writeEnd.setWaitableIdx(cstate.handles.insert(writeEnd));
+                        writeEnd.setHandle(localStreamTable.insert(writeEnd));
+                        if (writeEnd.streamTableIdx() !== tableIdx) {{ throw new Error("unexpectedly mismatched stream table"); }}
+
+                        const writeEndWaitableIdx = writeEnd.waitableIdx();
+                        const writeEndHandle = writeEnd.handle();
+                        writeWaitable.setTarget(`waitable for stream write end (waitable [${{writeEndWaitableIdx}}])`);
+                        writeEnd.setTarget(`stream write end (waitable [${{writeEndWaitableIdx}}])`);
+
+                        return {{
+                            writeEnd,
+                            writeEndWaitableIdx,
+                            writeEndHandle,
+                            readEndWaitableIdx,
+                            readEndHandle,
+                            readEnd,
+                        }};
+                    }}
+
+                    "#,
+                ));
+            }
+
+            Self::GetStreamEnd => {
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let get_stream_end_fn = self.name();
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let global_stream_table_map =
+                    render_args.require_intrinsic(Self::GlobalStreamTableMap);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+
+                output.push_str(&format!(
+                    r#"
+                    function {get_stream_end_fn}(args) {{
+                        {debug_log_fn}('[{get_stream_end_fn}()] args', args);
+                        const {{ tableIdx, streamEndHandle, streamEndWaitableIdx }} = args;
+                        if (tableIdx === undefined) {{
+                            throw new Error('missing table idx while getting stream end');
+                        }}
+
+                        const {{ table, componentIdx }} = {global_stream_table_map}[tableIdx];
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+
+                        let streamEnd;
+                        if (streamEndWaitableIdx !== undefined) {{
+                            streamEnd = cstate.handles.get(streamEndWaitableIdx);
+                        }} else if (streamEndHandle !== undefined) {{
+                            if (!table) {{ throw new Error(`missing/invalid table [${{tableIdx}}] while getting stream end`); }}
+                            streamEnd = table.get(streamEndHandle);
+                        }} else {{
+                            throw new TypeError("must specify either waitable idx or handle to retrieve stream");
+                        }}
+
+                        if (!streamEnd) {{
+                            throw new {runtime_error_class}(`missing stream end (tableIdx [${{tableIdx}}], handle [${{streamEndHandle}}], waitableIdx [${{streamEndWaitableIdx}}])`);
+                        }}
+                        if (tableIdx && streamEnd.streamTableIdx() !== tableIdx) {{
+                            throw new Error(`stream end table idx [${{streamEnd.streamTableIdx()}}] does not match [${{tableIdx}}]`);
+                        }}
+
+                        return streamEnd;
+                    }}
+
+                    "#,
+                ));
+            }
+
+            Self::DeleteStreamEnd => {
+                let delete_stream_end_fn = self.name();
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let global_stream_table_map =
+                    render_args.require_intrinsic(Self::GlobalStreamTableMap);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+
+                output.push_str(&format!(
+                    r#"
+                    function {delete_stream_end_fn}(args) {{
+                        {debug_log_fn}('[{delete_stream_end_fn}()] args', args);
+                        const {{ tableIdx, streamEndWaitableIdx }} = args;
+                        if (tableIdx === undefined) {{ throw new Error("missing table idx while removing stream end"); }}
+                        if (streamEndWaitableIdx === undefined) {{ throw new Error("missing stream idx while removing stream end"); }}
+
+                        const {{ table, componentIdx }} = {global_stream_table_map}[tableIdx];
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+
+                        const streamEnd = cstate.handles.get(streamEndWaitableIdx);
+                        if (!streamEnd) {{
+                            throw new Error(`missing stream end [${{streamEndWaitableIdx}}] in component handles while deleting stream`);
+                        }}
+                        if (streamEnd.streamTableIdx() !== tableIdx) {{
+                            throw new Error(`stream end table idx [${{streamEnd.streamTableIdx()}}] does not match [${{tableIdx}}]`);
+                        }}
+
+                        let removed = cstate.handles.remove(streamEnd.waitableIdx());
+                        if (!removed) {{
+                             throw new Error(`failed to remove stream end [${{streamEndWaitableIdx}}] waitable obj in component [${{componentIdx}}]`);
+                        }}
+
+                        removed = table.remove(streamEnd.handle());
+                        if (!removed) {{
+                             throw new Error(`failed to remove stream end with handle [${{streamEnd.handle()}}] from stream table [${{tableIdx}}] in component [${{componentIdx}}]`);
+                        }}
+
+                        return streamEnd;
+                    }}
+
+                    "#,
+                ));
+            }
+
+            Self::RemoveStreamEndFromTable => {
+                let remove_stream_end_from_table_fn = self.name();
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let global_stream_table_map =
+                    render_args.require_intrinsic(Self::GlobalStreamTableMap);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+
+                output.push_str(&format!(
+                    r#"
+                    function {remove_stream_end_from_table_fn}(args) {{
+                        {debug_log_fn}('[{remove_stream_end_from_table_fn}()] args', args);
+
+                        const {{ tableIdx, streamWaitableIdx }} = args;
+                        if (tableIdx === undefined) {{ throw new Error("missing table idx while removing stream end"); }}
+                        if (streamWaitableIdx === undefined) {{
+                            throw new Error("missing stream end waitable idx while removing stream end");
+                        }}
+
+                        const {{ table, componentIdx }} = {global_stream_table_map}[tableIdx];
+                        if (!table) {{ throw new Error(`missing/invalid table [${{tableIdx}}] while removing stream end`); }}
+
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+
+                        const streamEnd = cstate.handles.get(streamWaitableIdx);
+                        if (!streamEnd) {{
+                            throw new Error(`missing stream end (handle [${{streamWaitableIdx}}], table [${{tableIdx}}])`);
+                        }}
+                        const handle = streamEnd.handle();
+
+                        let removed = cstate.handles.remove(streamWaitableIdx);
+                        if (!removed) {{
+                            throw new Error(`failed to remove streamEnd from handles (waitable idx [${{streamWaitableIdx}}]), component [${{componentIdx}}])`);
+                        }}
+
+                        removed = table.remove(handle);
+                        if (!removed) {{
+                            throw new Error(`failed to remove streamEnd from table (handle [${{handle}}]), table [${{tableIdx}}], component [${{componentIdx}}])`);
+                        }}
+
+                        return streamEnd;
+                    }}
+                    "#,
+                ));
+            }
+
+            Self::StreamEndClass => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let stream_end_class = render_args.require_intrinsic(Self::StreamEndClass);
+                let async_event_code_enum =
+                    render_args.require_intrinsic(Intrinsic::AsyncEventCodeEnum);
+                output.push_str(&format!(
+                    r#"
+                    class {stream_end_class} {{
+                        static CopyResult = {{
+                            COMPLETED: 0,
+                            DROPPED: 1,
+                            CANCELLED: 2,
+                        }};
+
+                        static CopyState = {{
+                            IDLE: 1,
+                            SYNC_COPYING: 2,
+                            ASYNC_COPYING: 3,
+                            CANCELLING_COPY: 4,
+                            DONE: 5,
+                        }};
+
+                        #waitable = null;
+
+                        #tableIdx = null; // stream table that contains the stream end
+                        #idx = null; // stream end index in the table
+
+                        #componentIdx = null;
+
+                        #copyState = {stream_end_class}.CopyState.IDLE;
+
+                        #dropped = false;
+                        #isPeerDroppedFn;
+                        #notifyPeerDroppedFn;
+
+                        target;
+
+                        constructor(args) {{
+                            const {{ tableIdx, componentIdx }} = args;
+                            if (tableIdx === undefined || typeof tableIdx !== 'number') {{
+                                throw new TypeError(`missing table idx [${{tableIdx}}]`);
+                            }}
+                            if (tableIdx < 0 || tableIdx > 2_147_483_647) {{
+                                throw new TypeError(`invalid  tableIdx [${{tableIdx}}]`);
+                            }}
+                            if (!args.waitable) {{ throw new Error('missing/invalid waitable'); }}
+
+                            this.#tableIdx = args.tableIdx;
+                            this.#waitable = args.waitable;
+
+                            if (args.isPeerDroppedFn !== undefined && typeof args.isPeerDroppedFn !== 'function') {{
+                                throw new TypeError('isPeerDroppedFn must be a function');
+                            }}
+                            if (args.notifyPeerDroppedFn !== undefined && typeof args.notifyPeerDroppedFn !== 'function') {{
+                                throw new TypeError('notifyPeerDroppedFn must be a function');
+                            }}
+                            this.#isPeerDroppedFn = args.isPeerDroppedFn ?? (() => false);
+                            this.#notifyPeerDroppedFn = args.notifyPeerDroppedFn ?? (() => {{}});
+
+                            this.target = args.target;
+                        }}
+
+                        tableIdx() {{ return this.#tableIdx; }}
+
+                        idx() {{ return this.#idx; }}
+                        setIdx(idx) {{ this.#idx = idx; }}
+
+                        setTarget(tgt) {{ this.target = tgt; }}
+
+                        getWaitable() {{ return this.#waitable; }}
+                        setWaitable(w) {{ this.#waitable = w; }}
+
+                        setCopyState(state) {{ this.#copyState = state; }}
+                        getCopyState() {{ return this.#copyState; }}
+
+                        isCopying() {{
+                            switch (this.#copyState) {{
+                                case {stream_end_class}.CopyState.IDLE:
+                                case {stream_end_class}.CopyState.DONE:
+                                    return false;
+                                    break;
+                                case {stream_end_class}.CopyState.SYNC_COPYING:
+                                case {stream_end_class}.CopyState.ASYNC_COPYING:
+                                case {stream_end_class}.CopyState.CANCELLING_COPY:
+                                    return true;
+                                    break;
+                                default:
+                                    throw new Error('invalid/unknown copying state');
+                            }}
+                        }}
+
+                        setPendingEvent(fn) {{
+                            if (!this.#waitable) {{ throw new Error('missing/invalid waitable'); }}
+                            {debug_log_fn}('[{stream_end_class}#setPendingEvent()]', {{
+                                waitable: this.#waitable,
+                                waitableinSet: this.#waitable.isInSet(),
+                                componentIdx: this.#waitable.componentIdx(),
+                            }});
+                            this.#waitable.setPendingEvent(fn);
+                        }}
+
+                        hasPendingEvent() {{
+                            if (!this.#waitable) {{ throw new Error('missing/invalid waitable'); }}
+                            return this.#waitable.hasPendingEvent();
+                        }}
+
+                        isInSet() {{
+                            if (!this.#waitable) {{ throw new Error('missing/invalid waitable'); }}
+                            return this.#waitable.isInSet();
+                        }}
+
+                        getPendingEvent() {{
+                            if (!this.#waitable) {{ throw new Error('missing/invalid waitable'); }}
+                            {debug_log_fn}('[{stream_end_class}#getPendingEvent()]', {{
+                                waitable: this.#waitable,
+                                waitableinSet: this.#waitable.isInSet(),
+                                componentIdx: this.#waitable.componentIdx(),
+                            }});
+                            const event = this.#waitable.getPendingEvent();
+                            return event;
+                        }}
+
+                        isDropped() {{ return this.#dropped; }}
+                        isPeerDropped() {{ return this.#isPeerDroppedFn(); }}
+
+                        notifyDropped() {{
+                            if (this.isDropped() || this.isDoneState() || this.hasPendingEvent()) {{ return; }}
+                            const eventCode = this.isReadable()
+                                ? {async_event_code_enum}.STREAM_READ
+                                : {async_event_code_enum}.STREAM_WRITE;
+                            this.setPendingEvent(() => {{
+                                this.setCopyState({stream_end_class}.CopyState.DONE);
+                                return {{
+                                    code: eventCode,
+                                    payload0: this.waitableIdx(),
+                                    payload1: {stream_end_class}.CopyResult.DROPPED,
+                                }};
+                            }});
+                        }}
+
+                        drop(opts = {{}}) {{
+                            {debug_log_fn}('[{stream_end_class}#drop()]', {{
+                                waitable: this.#waitable,
+                                waitableinSet: this.#waitable.isInSet(),
+                                componentIdx: this.#waitable.componentIdx(),
+                            }});
+
+                            if (this.isDropped()) {{
+                                {debug_log_fn}('[{stream_end_class}#drop()] already dropped', {{
+                                    waitable: this.#waitable,
+                                    waitableinSet: this.#waitable.isInSet(),
+                                    componentIdx: this.#waitable.componentIdx(),
+                                }});
+                                return;
+                            }}
+
+                            this.#dropped = true;
+                            this.#notifyPeerDroppedFn();
+                            if (this.#waitable) {{
+                                const w = this.#waitable;
+                                if (opts.allowPendingEvent) {{
+                                    // A lifted host read can still be observing this event.
+                                    // Detach it from any guest waitable set, but leave the
+                                    // event available for the in-flight host read to consume.
+                                    w.join(null);
+                                }} else {{
+                                    w.drop();
+                                }}
+                            }}
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            // Stream Write/Read ends hold on to buffer(s) for the component from which the copy is being performed
+            // along with buffers for the component being written to.
+            //
+            // Depending on whether we're doing a write or a read, different parts of the class itself should be filled out,
+            // and the output below will have different members/functions available.
+            //
+            //
+            // TODO(fix): the stream class itself is ONE CLASS/need to share data. The classes don't have to be distinct.
+            //
+            Self::StreamReadableEndClass | Self::StreamWritableEndClass => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let (end_class_name, _js_stream_class_name) = match self {
+                    Self::StreamReadableEndClass => (self.name(), "ReadableStream"),
+                    Self::StreamWritableEndClass => (self.name(), "WritableStream"),
+                    _ => unreachable!("impossible stream readable end class intrinsic"),
+                };
+
+                let stream_end_class = render_args.require_intrinsic(Self::StreamEndClass);
+                let managed_buffer_class =
+                    render_args.require_intrinsic(Intrinsic::ManagedBufferClass);
+                let global_buffer_manager =
+                    render_args.require_intrinsic(Intrinsic::GlobalBufferManager);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let track_host_operation =
+                    render_args.require_intrinsic(ComponentIntrinsic::TrackHostOperation);
+
+                // Internal helper fn that sets up for a `copy()` call
+                let copy_setup_impl = format!(
+                    r#"
+                    setupCopy(args) {{
+                        const {{
+                            memory,
+                            ptr,
+                            count,
+                            eventCode,
+                            componentIdx,
+                            skipStateCheck,
+                        }} = args;
+                        if (eventCode === undefined) {{ throw new Error("missing/invalid event code"); }}
+
+                        let buffer = args.buffer;
+                        let bufferID = args.bufferID;
+
+                        // Only check invariants if we are *not* doing a follow-up/post-blocked read
+                        if (!skipStateCheck) {{
+                            if (this.isCopying()) {{
+                                throw new {runtime_error_class}({CANNOT_START_CONCURRENT_OPERATION:?});
+                            }}
+                            if (this.getCopyState() !== {stream_end_class}.CopyState.IDLE) {{
+                                throw new Error(`stream copy state is not idle`);
+                            }}
+                        }}
+
+                        const elemMeta = args.elemMeta ?? this.getElemMeta();
+                        if (elemMeta.isBorrowed) {{ throw new Error('borrowed types cannot be sent over streams'); }}
+
+                        // If we already have a managed buffer (likely host case), we can use that, otherwise we must
+                        // create a buffer (likely in the guest case)
+                        if (!buffer) {{
+                            const newBufferMeta = {global_buffer_manager}.createBuffer({{
+                                componentIdx,
+                                memory,
+                                start: ptr,
+                                count,
+                                // If creating a buffer for a write operation, the buffer we are encapsulating
+                                // is a *readable* buffer from the view of the component (as it has written to that buffer data that)
+                                // should be sent out
+                                isReadable: this.isWritable(),
+                                // If creating a buffer for a read operation, the buffer we are encapsulating
+                                // is a *writable* buffer from the view of the component (as it has prepared space to receive data)
+                                isWritable: this.isReadable(),
+                                elemMeta,
+                            }});
+                            bufferID = newBufferMeta.id;
+                            buffer = newBufferMeta.buffer;
+                            buffer.setTarget(`component [${{componentIdx}}] {end_class_name} buffer (id [${{bufferID}}], count [${{count}}], eventCode [${{eventCode}}])`);
+                        }}
+
+                        const streamEnd = this;
+                        const processFn = (result, reclaimBufferFn, rejectedLength) => {{
+                            if (reclaimBufferFn) {{ reclaimBufferFn(); }}
+
+                            // Copy events are materialized lazily. Cancellation may begin
+                            // after progress queued a COMPLETED event but before the guest
+                            // consumed it; preserve the count and report the cancellation.
+                            if (result === {stream_end_class}.CopyResult.COMPLETED
+                                && streamEnd.getCopyState() === {stream_end_class}.CopyState.CANCELLING_COPY
+                                && !streamEnd.hasHostInject()) {{
+                                result = {stream_end_class}.CopyResult.CANCELLED;
+                            }}
+
+                            if (result === {stream_end_class}.CopyResult.DROPPED) {{
+                                streamEnd.setCopyState({stream_end_class}.CopyState.DONE);
+                            }} else {{
+                                streamEnd.setCopyState({stream_end_class}.CopyState.IDLE);
+                            }}
+
+                            if (result < 0 || result >= 16) {{
+                                throw new Error(`unsupported stream copy result [${{result}}]`);
+                            }}
+                            if (buffer.processed >= {managed_buffer_class}.MAX_LENGTH) {{
+                                 throw new Error(`processed count [${{buf.length}}] greater than max length`);
+                            }}
+                            if (buffer.length > 2**28) {{ throw new Error('buffer uses reserved space'); }}
+
+                            const packedResult = (Number(buffer.processed) << 4) | result;
+                            const event = {{ code: eventCode, payload0: streamEnd.waitableIdx(), payload1: packedResult }};
+                            if (rejectedLength !== undefined) {{
+                                event.rejectedLength = rejectedLength;
+                            }}
+
+                            return event;
+                        }};
+
+                        const onCopyFn = (reclaimBufferFn, result = {stream_end_class}.CopyResult.COMPLETED) => {{
+                            streamEnd.setPendingEvent(() => {{
+                                return processFn(result, reclaimBufferFn);
+                            }});
+                        }};
+
+                        const onCopyDoneFn = (result, rejectedLength) => {{
+                            streamEnd.setPendingEvent(() => {{
+                                return processFn(result, undefined, rejectedLength);
+                            }});
+                        }};
+
+                        return {{ bufferID, buffer, onCopyFn, onCopyDoneFn }};
+                    }}
+                    "#
+                );
+
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+
+                let (rw_fn_name, inner_rw_impl) = match self {
+                    // Internal implementation for writing to internal buffer after reading from a provided managed buffers
+                    //
+                    // This is called by both the host and the guest
+                    Self::StreamWritableEndClass => (
+                        "write",
+                        format!(
+                            r#"
+                            _write(args) {{
+                                const {{ buffer, onCopyFn, onCopyDoneFn, componentIdx, dropAfterCopy }} = args;
+                                if (!buffer) {{ throw new TypeError('missing/invalid buffer'); }}
+                                if (!onCopyFn) {{ throw new TypeError("missing/invalid onCopy handler"); }}
+                                if (!onCopyDoneFn) {{ throw new TypeError("missing/invalid onCopyDone handler"); }}
+                                if (this.isDropped()) {{
+                                    onCopyDoneFn({stream_end_class}.CopyResult.DROPPED);
+                                    return;
+                                }}
+
+                                if (!this.#pendingBufferMeta.buffer) {{
+                                    // A just-in-time host-injected write found no reader buffer: the
+                                    // target read was cancelled. Return the undelivered items to the
+                                    // source (redelivered by a later read) instead of stranding
+                                    // (which blocks on a future read -- can deadlock a stream whose
+                                    // write waits on its reader -- or is dropped at stream end).
+                                    if (this.#sourceRebufferFn && buffer.isHostOwned()) {{
+                                        const remaining = buffer.remaining();
+                                        if (remaining > 0) {{ this.#sourceRebufferFn(buffer.read(remaining)); }}
+                                        onCopyDoneFn({stream_end_class}.CopyResult.COMPLETED);
+                                        return;
+                                    }}
+                                    this.setPendingBufferMeta({{ componentIdx, buffer, onCopyFn, onCopyDoneFn, dropAfterCopy }});
+                                    return;
+                                }}
+
+                                const pendingElemMeta = this.#pendingBufferMeta.buffer.getElemMeta();
+                                const newBufferElemMeta = buffer.getElemMeta();
+                                if (pendingElemMeta.payloadTypeName !== newBufferElemMeta.payloadTypeName) {{
+                                    throw new {runtime_error_class}("stream end type does not match internal buffer");
+                                }}
+
+                                // If the buffer came from the same component that is currently doing the operation
+                                // we're doing a inter-component write, and only unit or numeric types are allowed
+                                const pendingElemIsNoneOrNumeric = pendingElemMeta.isNone || pendingElemMeta.isNumeric;
+                                // (Canonical ABI `End.copy`: only when both sides have elements to
+                                // copy; zero-length reads and writes complete without copying.)
+                                if (this.#pendingBufferMeta.componentIdx === buffer.componentIdx() && buffer.componentIdx() !== -1 && !pendingElemIsNoneOrNumeric
+                                    && buffer.remaining() > 0 && this.#pendingBufferMeta.buffer.remaining() > 0) {{
+                                    throw new {runtime_error_class}(`cannot stream non-numeric types within the same component (component [${{buffer.componentIdx()}}], send)`);
+                                }}
+
+                                // If original capacities were zero, we're dealing with a unit stream,
+                                // a write to the unit stream is instantly copied without any work.
+                                if (buffer.capacity === 0 && this.#pendingBufferMeta.buffer.capacity === 0) {{
+                                    onCopyDoneFn({stream_end_class}.CopyResult.COMPLETED);
+                                    return;
+                                }}
+
+                                // If the internal buffer has no space left to take writes,
+                                // the write is complete, we must reset and wait for another read
+                                // to clear up space in the buffer.
+                                if (this.#pendingBufferMeta.buffer.remaining() === 0) {{
+                                    this.resetAndNotifyPending({stream_end_class}.CopyResult.COMPLETED);
+                                    this.setPendingBufferMeta({{ componentIdx, buffer, onCopyFn, onCopyDoneFn, dropAfterCopy }});
+                                    return;
+                                }}
+
+                                const shouldDropAfterCopy = dropAfterCopy || this.#pendingBufferMeta.dropAfterCopy;
+
+                                // At this point it is implied that remaining is > 0,
+                                // so if there is still remaining capacity in the incoming buffer, perform copy of values
+                                // to the internal buffer from the incoming buffer
+                                let transferred = false;
+                                if (buffer.remaining() > 0) {{
+                                    const rejectLength = this.#pendingBufferMeta.rejectLength;
+                                    if (rejectLength !== undefined && buffer.remaining() > rejectLength) {{
+                                        const pendingOnCopyDoneFn = this.#pendingBufferMeta.onCopyDoneFn;
+                                        this.resetPendingBufferMeta();
+                                        pendingOnCopyDoneFn({stream_end_class}.CopyResult.DROPPED, buffer.remaining());
+                                        onCopyDoneFn({stream_end_class}.CopyResult.DROPPED);
+                                        return;
+                                    }}
+                                    const numElements = Math.min(buffer.remaining(), this.#pendingBufferMeta.buffer.remaining());
+                                    const transferResources = buffer.componentIdx() !== -1
+                                        && this.#pendingBufferMeta.buffer.componentIdx() !== -1;
+                                    this.#pendingBufferMeta.buffer.write(
+                                        buffer.read(numElements, {{ transferResources }}),
+                                        {{ transferResources }},
+                                    );
+                                    this.#pendingBufferMeta.onCopyFn(
+                                        () => this.resetPendingBufferMeta(),
+                                        shouldDropAfterCopy
+                                            ? {stream_end_class}.CopyResult.DROPPED
+                                            : {stream_end_class}.CopyResult.COMPLETED,
+                                    );
+                                    transferred = true;
+                                }}
+
+                                onCopyDoneFn(
+                                    shouldDropAfterCopy
+                                        ? {stream_end_class}.CopyResult.DROPPED
+                                        : {stream_end_class}.CopyResult.COMPLETED,
+                                );
+                            }}
+                        "#,
+                        ),
+                    ),
+
+                    // Internal implementation for reading from an internal buffer and writing to a provided managed buffer
+                    //
+                    // This is called by both the host and the guest
+                    Self::StreamReadableEndClass => (
+                        "read",
+                        format!(
+                            r#"
+                            _read(args) {{
+                                const {{ buffer, onCopyDoneFn, onCopyFn, componentIdx, rejectLength, dropAfterCopy }} = args;
+                                if (this.isDropped()) {{
+                                    onCopyDoneFn({stream_end_class}.CopyResult.DROPPED);
+                                    return;
+                                }}
+
+                                if (!this.#pendingBufferMeta.buffer) {{
+                                    this.setPendingBufferMeta({{
+                                        componentIdx,
+                                        buffer,
+                                        onCopyFn,
+                                        onCopyDoneFn,
+                                        rejectLength,
+                                        dropAfterCopy,
+                                    }});
+                                    return;
+                                }}
+
+                                const pendingElemMeta = this.#pendingBufferMeta.buffer.getElemMeta();
+                                const newBufferElemMeta = buffer.getElemMeta();
+                                if (pendingElemMeta.payloadTypeName !== newBufferElemMeta.payloadTypeName) {{
+                                    throw new {runtime_error_class}("stream end type does not match internal buffer");
+                                }}
+
+                                // Since we do not know the string encoding until a write is performed, it is possible that
+                                // one end (i.e. the read end) does not yet know the appropriate string encoding to use when
+                                // lifting/lowering.
+                                if (newBufferElemMeta.stringEncoding === undefined || pendingElemMeta.stringEncoding === undefined) {{
+                                    const encoding = pendingElemMeta.stringEncoding ?? newBufferElemMeta.stringEncoding;
+                                    if (encoding === undefined) {{ throw new Error('both writer & reader missing string encoding'); }}
+                                    newBufferElemMeta.stringEncoding = encoding;
+                                    pendingElemMeta.stringEncoding = encoding;
+                                }}
+
+                                // If the buffer came from the same component that is currently doing the operation
+                                // we're doing a inter-component read, and only unit or numeric types are allowed
+                                const pendingElemIsNoneOrNumeric = pendingElemMeta.isNone || pendingElemMeta.isNumeric;
+                                // (Canonical ABI `End.copy`: only when both sides have elements to
+                                // copy; zero-length reads and writes complete without copying.)
+                                if (this.#pendingBufferMeta.componentIdx === buffer.componentIdx() && buffer.componentIdx() !== -1 && !pendingElemIsNoneOrNumeric
+                                    && buffer.remaining() > 0 && this.#pendingBufferMeta.buffer.remaining() > 0) {{
+                                    throw new {runtime_error_class}(`cannot stream non-numeric types within the same component (component [${{buffer.componentIdx()}}] read)`);
+                                }}
+
+                                const pendingRemaining = this.#pendingBufferMeta.buffer.remaining();
+                                const shouldDropAfterCopy = dropAfterCopy || this.#pendingBufferMeta.dropAfterCopy;
+                                let transferred = false;
+                                if (pendingRemaining > 0) {{
+                                    const bufferRemaining = buffer.remaining();
+                                    if (rejectLength !== undefined && pendingRemaining > rejectLength) {{
+                                        this.resetAndNotifyPending({stream_end_class}.CopyResult.DROPPED);
+                                        onCopyDoneFn({stream_end_class}.CopyResult.DROPPED, pendingRemaining);
+                                        return;
+                                    }}
+                                    if (bufferRemaining > 0) {{
+                                        const count = Math.min(pendingRemaining, bufferRemaining);
+                                        const transferResources = buffer.componentIdx() !== -1
+                                            && this.#pendingBufferMeta.buffer.componentIdx() !== -1;
+                                        buffer.write(
+                                            this.#pendingBufferMeta.buffer.read(count, {{ transferResources }}),
+                                            {{ transferResources }},
+                                        );
+                                        this.#pendingBufferMeta.onCopyFn(
+                                            () => this.resetPendingBufferMeta(),
+                                            shouldDropAfterCopy
+                                                ? {stream_end_class}.CopyResult.DROPPED
+                                                : {stream_end_class}.CopyResult.COMPLETED,
+                                        );
+                                        transferred = true;
+                                    }}
+
+                                    onCopyDoneFn(
+                                        shouldDropAfterCopy
+                                            ? {stream_end_class}.CopyResult.DROPPED
+                                            : {stream_end_class}.CopyResult.COMPLETED,
+                                    );
+
+                                    return;
+                                }}
+
+                                this.resetAndNotifyPending({stream_end_class}.CopyResult.COMPLETED);
+                                this.setPendingBufferMeta({{ componentIdx, buffer, onCopyFn, onCopyDoneFn, rejectLength, dropAfterCopy }});
+                            }}
+                            "#,
+                        ),
+                    ),
+                    _ => unreachable!("invalid stream end enum"),
+                };
+
+                let async_blocked_const = render_args.require_intrinsic(Intrinsic::AsyncTask(
+                    AsyncTaskIntrinsic::AsyncBlockedConstant,
+                ));
+
+                let current_task_get_fn = render_args
+                    .require_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+
+                // NOTE: This shared copy impl is meant to be called from *outside* the stream end class in question,
+                // but internally to the bindgen-generated code (i.e. from `stream.{read,write}` or from a
+                // read on an external stream class)
+                let copy_impl = format!(
+                    r#"
+                         copy(args) {{
+                             const {{
+                                 isAsync,
+                                 memory,
+                                 componentIdx,
+                                 ptr,
+                                 count,
+                                 eventCode,
+                                 initial,
+                                 skipStateCheck,
+                                 stringEncoding,
+                                 reallocFn,
+                                 rejectLength,
+                                 elemMeta,
+                                 dropAfterCopy,
+                                 deferSyncFinish,
+                             }} = args;
+                             if (eventCode === undefined) {{ throw new TypeError('missing/invalid event code'); }}
+
+                             // The operation's metadata supplies the current component's
+                             // lift/lower functions, while the stream's metadata supplies
+                             // the canonical payload identity shared across components.
+                             const copyElemMeta = elemMeta
+                                 ? {{ ...elemMeta, payloadTypeName: this.#elemMeta.payloadTypeName }}
+                                 : this.#elemMeta;
+                             if (copyElemMeta.stringEncoding === undefined && stringEncoding) {{
+                                copyElemMeta.stringEncoding = stringEncoding;
+                             }}
+                             if (copyElemMeta.stringEncoding && stringEncoding && copyElemMeta.stringEncoding !== stringEncoding) {{
+                                 throw new Error(`inconsistent string encoding (previously [${{copyElemMeta.stringEncoding}}], now [${{stringEncoding}}])`);
+                             }}
+
+                             if (args.getReallocFn && copyElemMeta.getReallocFn === undefined) {{
+                                 copyElemMeta.getReallocFn = args.getReallocFn;
+                             }}
+
+                             if (this.hasPendingEvent()) {{
+                                 const event = this.getPendingEvent();
+                                 if (event.code !== eventCode || event.payload0 !== this.waitableIdx()) {{
+                                     throw new Error("invalid pending event during stream operation");
+                                 }}
+                                 if (this.isWritable() && this.isPeerDropped()) {{
+                                     this.setCopyState({stream_end_class}.CopyState.DONE);
+                                     return (event.payload1 & ~0xf) | {stream_end_class}.CopyResult.DROPPED;
+                                 }}
+                                 return event.payload1;
+                             }}
+
+                             if (this.isDropped() || this.isPeerDropped()) {{
+                                 if (this.#pendingBufferMeta?.onCopyDoneFn) {{
+                                     const f = this.#pendingBufferMeta.onCopyDoneFn;
+                                     this.#pendingBufferMeta.onCopyDoneFn = null;
+                                     f({stream_end_class}.CopyResult.DROPPED);
+                                 }}
+                                 this.setCopyState({stream_end_class}.CopyState.DONE);
+                                 return {stream_end_class}.CopyResult.DROPPED;
+                             }}
+
+                             const {{ buffer, onCopyFn, onCopyDoneFn }} = this.setupCopy({{
+                                 memory,
+                                 eventCode,
+                                 componentIdx,
+                                 ptr,
+                                 count,
+                                 buffer: args.buffer,
+                                 bufferID: args.bufferID,
+                                 initial,
+                                 skipStateCheck,
+                                 elemMeta: copyElemMeta,
+                             }});
+
+                             // If the stream is readable and was lowered from the host, the
+                             // writer is host-side. Register the read first; host injection
+                             // will no-op if the read already produced a pending event.
+                             const injectHostWrite = this.isReadable() && !!this.#hostInjectFn;
+
+                             // Perform the read/write
+                             this._{rw_fn_name}({{
+                                 buffer,
+                                 onCopyFn,
+                                 onCopyDoneFn,
+                                 componentIdx,
+                                 rejectLength,
+                                 dropAfterCopy,
+                             }});
+
+                             let injectedWritePromise;
+                             if (injectHostWrite) {{
+                                 injectedWritePromise = this.#hostInjectFn({{ count }});
+                             }}
+
+                             const finishCopy = () => {{
+                                 const event = this.getPendingEvent();
+                                 if (!event) {{ throw new Error("unexpectedly missing pending event"); }}
+                                 if (event.code === undefined || event.payload0 === undefined || event.payload1 === undefined) {{
+                                     throw new Error("unexpectedly malformed event");
+                                 }}
+
+                                 const {{ code, payload0: index, payload1: payload }} = event;
+
+                                 const waitableIdx = this.getWaitable().idx();
+                                 if (code !== eventCode  || index !== waitableIdx || payload === {async_blocked_const}) {{
+                                     const errMsg = "invalid event code/event during stream operation";
+                                     {debug_log_fn}(errMsg, {{
+                                         event,
+                                         payload,
+                                         payloadIsBlockedConst: payload === {async_blocked_const},
+                                         code,
+                                         eventCode,
+                                         codeDoesNotMatchEventCode: code !== eventCode,
+                                         index,
+                                         internalEndIdx: waitableIdx,
+                                         indexDoesNotMatch: index !== waitableIdx,
+                                     }});
+                                     throw new Error(errMsg);
+                                 }}
+
+                                 if (event.rejectedLength !== undefined) {{
+                                     this.#rejectedLength = event.rejectedLength;
+                                 }}
+                                 if (this.isWritable() && this.isPeerDropped()) {{
+                                     this.setCopyState({stream_end_class}.CopyState.DONE);
+                                     return (payload & ~0xf) | {stream_end_class}.CopyResult.DROPPED;
+                                 }}
+                                 return payload;
+                             }};
+
+                             if (!this.hasPendingEvent()) {{
+                                 if (isAsync) {{
+                                     this.setCopyState({stream_end_class}.CopyState.ASYNC_COPYING);
+                                     {debug_log_fn}('[{stream_end_class}#copy()] blocked', {{ componentIdx, eventCode, self: this }});
+                                     if (injectedWritePromise) {{
+                                         // Do not await here: the injected write may depend on sibling
+                                         // guest work running, so the canonical read must return BLOCKED.
+                                         injectedWritePromise.then(
+                                             cleanupFn => cleanupFn(),
+                                             err => this.setPendingEvent(() => {{ throw err; }}),
+                                         );
+                                     }}
+                                     return {async_blocked_const};
+                                 }} else {{
+                                     this.setCopyState({stream_end_class}.CopyState.SYNC_COPYING);
+
+                                     const taskMeta = {current_task_get_fn}(componentIdx);
+                                     if (!taskMeta) {{ throw new Error(`missing task meta for component idx [${{componentIdx}}]`); }}
+
+                                     const task = taskMeta.task;
+                                     if (!task) {{ throw new Error('missing task task from task meta'); }}
+
+                                     const streamEnd = this;
+                                     return task.suspendUntil({{
+                                         readyFn: () => streamEnd.hasPendingEvent(),
+                                     }}).then(async () => {{
+                                         if (deferSyncFinish) {{ await Promise.resolve(); }}
+                                         if (!injectedWritePromise) {{ return finishCopy(); }}
+                                         return injectedWritePromise.then(cleanupFn => {{
+                                             cleanupFn();
+                                             return finishCopy();
+                                         }});
+                                     }});
+                                 }}
+                             }}
+
+                             if (!injectedWritePromise) {{ return finishCopy(); }}
+                             if (isAsync) {{
+                                 injectedWritePromise.then(
+                                     cleanupFn => cleanupFn(),
+                                     err => this.setPendingEvent(() => {{ throw err; }}),
+                                 );
+                                 return finishCopy();
+                             }}
+                             return injectedWritePromise.then(cleanupFn => {{
+                                 cleanupFn();
+                                 return finishCopy();
+                             }});
+                         }}
+                    "#
+                );
+
+                let type_getter_impl = match self {
+                    Self::StreamWritableEndClass => "
+                         isReadable() { return false; }
+                         isWritable() { return true; }
+                    "
+                    .to_string(),
+                    Self::StreamReadableEndClass => "
+                         isReadable() { return true; }
+                         isWritable() { return false; }
+                    "
+                    .to_string(),
+                    _ => unreachable!("impossible stream readable end class intrinsic"),
+                };
+
+                let async_event_code_enum =
+                    render_args.require_intrinsic(Intrinsic::AsyncEventCodeEnum);
+                let promise_with_resolvers_fn =
+                    render_args.require_intrinsic(Intrinsic::PromiseWithResolversPonyfill);
+
+                // NOTE: these action implementations `write()` and `read()` are normally called
+                // from the host -- internally components will use the `stream.{write, read}` intrinsics
+                // which call the `copy()` function on the stream end class directly.
+                let action_impl = match self {
+                    Self::StreamWritableEndClass => format!(
+                        r#"
+                         async write(v) {{
+                            {debug_log_fn}('[{end_class_name}#write()] args', {{ v }});
+
+                            let data;
+                            if (this.#elemMeta.isNumeric) {{
+                                if (v instanceof ArrayBuffer) {{
+                                    v = new Uint8Array(v);
+                                }}
+                                data = Array.isArray(v) || (ArrayBuffer.isView(v) && typeof v.length === 'number') ? Array.from(v) : [v];
+                            }} else {{
+                                data = [v];
+                            }}
+                            return this.writeMany(data);
+                         }}
+
+                         async writeMany(values, opts = {{}}) {{
+                            {debug_log_fn}('[{end_class_name}#writeMany()] args', {{ values }});
+                            if (!Array.isArray(values)) {{ throw new TypeError("writeMany values must be an array"); }}
+
+                            // Wait for an existing write operation to end, if present,
+                            // otherwise register this write for any future operations.
+                            //
+                            // NOTE: this complexity below is an attempt to sequence operations
+                            // to ensure consecutive writes only wait on their direct predecessors,
+                            // (i.e. write #3 must wait on write #2, *not* write #1)
+                            //
+                            let newResult = {promise_with_resolvers_fn}();
+                            if (this.#result && !this.#isHostOwned) {{
+                                try {{
+                                    const p = this.#result.promise;
+                                    this.#result = newResult;
+                                    await p;
+                                }} catch (err) {{
+                                    {debug_log_fn}('[{end_class_name}#writeMany()] error waiting for previous write', err);
+                                    // If the previous write we were waiting on errors for any reason,
+                                    // we can ignore it and attempt to continue with this write
+                                    // which may also fail for a similar reason
+                                }}
+                            }} else {{
+                                this.#result = newResult;
+                            }}
+                            const {{ promise, resolve, reject }} = newResult;
+
+                            const data = values;
+                            const count = data.length;
+                            if (this.#elemMeta.stringEncoding === undefined) {{
+                                this.#elemMeta.string = 'utf8';
+                            }}
+
+                            try {{
+                                const {{ id: bufferID, buffer }} = {global_buffer_manager}.createBuffer({{
+                                    componentIdx: -1,
+                                    count,
+                                    isReadable: true, // we need to read from this buffer later
+                                    isWritable: false,
+                                    elemMeta: this.#elemMeta,
+                                    data,
+                                }});
+                                buffer.setTarget(`host stream write buffer (id [${{bufferID}}], count [${{count}}], data len [${{data.length}}])`);
+
+                                let packedResult;
+                                const copyPromise = this.copy({{
+                                    isAsync: true,
+                                    count,
+                                    bufferID,
+                                    buffer,
+                                    eventCode: {async_event_code_enum}.STREAM_WRITE,
+                                    componentIdx: -1,
+                                    dropAfterCopy: opts.dropAfterCopy === true,
+                                }});
+                                if (this.#isHostOwned && this.hasPendingEvent()) {{
+                                    // Host owned writes are just-in-time writes for an already pending guest read.
+                                    // The guest read path consumes the pending event, so waiting here can deadlock.
+                                    copyPromise.catch(err => reject(err));
+                                    this.#result = null;
+                                    resolve();
+                                    return await promise;
+                                }}
+                                packedResult = await copyPromise;
+
+                                // If we are dealing with a blocked component write operation, we do an immedaite wait
+                                // on the host side to pause the host until the write can be completed.
+                                //
+                                // We do not do this if we're dealing with a host injection,
+                                // (i.e. a lowered read end into a component does a read() and forces
+                                // data to be read from the host side), we must signal the write is completed
+                                // and we are waiting for the read.
+                                //
+                                //  In the host injection case, it is OK that the write is blocked, because we
+                                //  know the read is about to occur (we control the writes to the stream to be
+                                // just-before reads, no matter what the user does on the other end).
+                                //
+                                if (packedResult === {async_blocked_const} && !this.#isHostOwned) {{
+                                    // If the write was blocked, the pending event produced by the
+                                    // read side represents the completed copy.
+
+                                    await new Promise((resolve) => {{
+                                        let waitInterval = setInterval(async () => {{
+                                            if (!this.hasPendingEvent()) {{ return; }}
+                                            clearInterval(waitInterval);
+                                            resolve();
+                                        }});
+                                    }});
+
+                                    if (!this.hasPendingEvent()) {{
+                                        throw new Error("missing pending event after blocked stream write");
+                                    }}
+
+                                    const event = this.getPendingEvent();
+                                    if (!event) {{ throw new Error("missing pending event after blocked stream write"); }}
+
+                                    const {{ code, payload0: index, payload1: payload }} = event;
+
+                                    if (code !== {async_event_code_enum}.STREAM_WRITE) {{
+                                        throw new Error(`mismatched event code [${{code}}] for host stream write`);
+                                    }}
+
+                                    if (index !== this.waitableIdx()) {{ throw new Error('invalid stream end index'); }}
+                                    packedResult = payload;
+
+                                    const copied = packedResult >> 4;
+                                    if (copied === 0 && this.isDoneState()) {{
+                                       reject(new Error("read end dropped during write"));
+                                    }}
+
+                                    if (packedResult === {async_blocked_const}) {{
+                                        throw new Error("unexpected double block during write");
+                                    }}
+                                }}
+
+
+                                // Host owned writes were not necessarily unblocked, but are always blocked
+                                // because they happen just-before a component read (via a lowered end).
+                                //
+                                // In this case, we cant to declare the copy state back to idle
+                                // for the next write that is performed, assuming there may be more writes
+                                // to do.
+                                //
+                                // if (this.#hostOwned) {{
+                                //    this.setCopyState({stream_end_class}.CopyState.IDLE);
+                                // }}
+
+                                // If the write was not blocked, we can resolve right away
+                                this.#result = null;
+                                resolve();
+
+                            }} catch (err) {{
+                                {debug_log_fn}('[{end_class_name}#write()] error', err);
+                                reject(err);
+                            }}
+
+                            return await promise;
+                         }}
+                        "#
+                    ),
+
+                    // NOTE: Host stream reads typically take this path, via `ExternalStream` class's
+                    // `read()` function which calls the underlying stream end's `read()`
+                    // fn (below) via an anonymous function.
+                    Self::StreamReadableEndClass => format!(
+                        r#"
+                         async read(opts = 1) {{
+                            {debug_log_fn}('[{end_class_name}#read()]');
+
+                            if (this.#endOfStream) {{
+                                return {{ value: undefined, done: true }};
+                            }}
+                            let {{ count, rejectLength, dropAfterCopy }} = this.#readOpts(opts);
+
+                            // Wait for an existing read operation to end, if present,
+                            // otherwise register this read for any future operations.
+                            //
+                            // NOTE: this complexity below is an attempt to sequence operations
+                            // to ensure consecutive reads only wait on their direct predecessors,
+                            // (i.e. read #3 must wait on read #2, *not* read #1)
+                            //
+                            const newResult = {promise_with_resolvers_fn}();
+                            if (this.#result) {{
+                                try {{
+                                    const p = this.#result.promise;
+                                    this.#result = newResult;
+                                    await p;
+                                }} catch (err) {{
+                                    {debug_log_fn}('[{end_class_name}#read()] error waiting for previous read', err);
+                                    // If the previous write we were waiting on errors for any reason,
+                                    // we can ignore it and attempt to continue with this read
+                                    // which may also fail for a similar reason
+                                }}
+                            }} else {{
+                                this.#result = newResult;
+                            }}
+                            const {{ promise, resolve, reject }} = newResult;
+
+                            // TODO(fix): when we do a read, we need to GET the string encoding from the
+                            // other side, via the lift/lower fn?
+
+                            count = Math.min(count, {managed_buffer_class}.MAX_LENGTH);
+                            try {{
+                                const {{ id: bufferID, buffer }} = {global_buffer_manager}.createBuffer({{
+                                    componentIdx: -1, // componentIdx of -1 indicates the host
+                                    count,
+                                    isReadable: false,
+                                    isWritable: true, // we need to write out the pending buffer (if present)
+                                    elemMeta: this.#elemMeta,
+                                    data: [],
+                                }});
+                                buffer.setTarget(`host stream read buffer (id [${{bufferID}}], count [${{count}}])`);
+
+                                let packedResult;
+                                packedResult = await this.copy({{
+                                    isAsync: true,
+                                    count,
+                                    bufferID,
+                                    buffer,
+                                    eventCode: {async_event_code_enum}.STREAM_READ,
+                                    componentIdx: -1,
+                                    rejectLength,
+                                    dropAfterCopy,
+                                }});
+
+                                if (packedResult === {async_blocked_const}) {{
+                                    // If the read was blocked, the pending event produced by the
+                                    // write side represents the completed copy.
+
+                                    await new Promise((resolve) => {{
+                                        let waitInterval = setInterval(() => {{
+                                            if (!this.hasPendingEvent()) {{ return; }}
+                                            clearInterval(waitInterval);
+                                            resolve();
+                                        }});
+                                    }});
+
+                                    if (!this.hasPendingEvent()) {{
+                                        throw new Error("missing pending event after blocked stream read");
+                                    }}
+
+                                    const event = this.getPendingEvent();
+                                    if (!event) {{ throw new Error("missing pending event after blocked stream read"); }}
+
+                                    const {{ code, payload0: index, payload1: payload }} = event;
+
+                                    if (code !== {async_event_code_enum}.STREAM_READ) {{
+                                        throw new Error(`mismatched event code [${{code}}] for host stream read`);
+                                    }}
+
+                                    if (index !== this.waitableIdx()) {{ throw new Error('invalid stream end index'); }}
+                                    if (event.rejectedLength !== undefined) {{
+                                        this.#rejectedLength = event.rejectedLength;
+                                    }}
+                                    packedResult = payload;
+
+                                    if (packedResult === {async_blocked_const}) {{
+                                        throw new Error("unexpected double block during read");
+                                    }}
+                                }}
+
+                                const resultKind = packedResult & 0xF;
+                                const transferred = packedResult >> 4;
+
+                                // The copy event is published from inside the guest's current
+                                // callback slice. Do not expose lifted values to host code until
+                                // that slice has returned and released the instance lock: the
+                                // consumer may immediately make a synchronous call on a lifted
+                                // resource, which cannot itself wait for a contended lock.
+                                const componentIdx = this.getWaitable().componentIdx();
+                                if (componentIdx !== -1) {{
+                                    await {get_or_create_async_state_fn}(componentIdx).waitForExclusiveRelease();
+                                }}
+
+                                if (resultKind === {stream_end_class}.CopyResult.DROPPED) {{
+                                    this.#endOfStream = true;
+                                }}
+
+                                if (transferred > 0) {{
+                                    const values = buffer.read(transferred);
+                                    const {{ typedArray }} = this.#elemMeta;
+                                    const value = typedArray === undefined ? count === 1 ? values[0] : values : new typedArray(values);
+                                    this.#result = null;
+                                    // An option's none value is undefined, but still an item.
+                                    resolve({{ value, done: false }});
+                                }} else {{
+                                    this.#result = null;
+                                    resolve({{ value: undefined, done: true }});
+                                }}
+
+                            }} catch (err) {{
+                                {debug_log_fn}('[{end_class_name}#read()] error', err);
+                                reject(err);
+                            }}
+
+                            const result = await promise;
+                            const rejectedLength = this.#rejectedLength;
+                            this.#rejectedLength = null;
+                            if (rejectedLength !== null) {{
+                                result.rejectedLength = rejectedLength;
+                            }}
+                            return result;
+                         }}
+
+                         #readOpts(opts) {{
+                             const count = opts === undefined ? 1 : typeof opts === "number" ? opts : opts && typeof opts === "object" ? opts.count ?? 1 : undefined;
+                             const rejectLength = opts && typeof opts === "object" ? opts.rejectLength : undefined;
+                             if (!Number.isInteger(count) || count < (rejectLength !== undefined ? 0 : 1)) {{
+                                 throw new TypeError(`invalid stream read count [${{count}}]`);
+                             }}
+                             if (rejectLength !== undefined && (!Number.isInteger(rejectLength) || rejectLength < 0)) {{
+                                 throw new TypeError(`invalid stream read reject length [${{rejectLength}}]`);
+                             }}
+                             const dropAfterCopy = opts && typeof opts === "object" ? opts.dropAfterCopy === true : false;
+                             return {{ count, rejectLength, dropAfterCopy }};
+                         }}
+                        "#
+                    ),
+                    _ => unreachable!("impossible stream readable end class intrinsic"),
+                };
+
+                output.push_str(&format!(r#"
+                    class {end_class_name} extends {stream_end_class} {{
+                        #copying = false;
+                        #done = false;
+
+                        #elemMeta = null;
+                        // held by both write and read ends
+                        #pendingBufferMeta = null;
+
+                        // table index that the stream is in (can change after a stream transfer)
+                        #streamTableIdx;
+                        // handle (index) inside the given table (can change after a stream transfer)
+                        #handle;
+
+                        // internal stream (which has both ends) rep
+                        #globalStreamMapRep;
+
+                        // only populated for lowered (read) stream ends
+                        #hostInjectFn;
+                        #hostDropFn;
+                        #hostCancelFn;
+                        // only populated for the write side of a lowered read stream end
+                        #isHostOwned;
+
+                        #result = null;
+                        #sourceRebufferFn = null;
+
+                        #endOfStream = false;
+                        #rejectedLength = null;
+
+                        constructor(args) {{
+                            {debug_log_fn}('[{end_class_name}#constructor()] args', args);
+                            super(args);
+
+                            if (!args.elemMeta) {{ throw new Error('missing/invalid element meta'); }}
+                            this.#elemMeta = args.elemMeta;
+
+                            if (!args.pendingBufferMeta) {{ throw new Error('missing/invalid shared pending buffer meta'); }}
+                            this.#pendingBufferMeta = args.pendingBufferMeta;
+
+                            if (args.tableIdx === undefined) {{ throw new Error('missing index for stream table idx'); }}
+                            this.#streamTableIdx = args.tableIdx;
+
+                            this.#hostInjectFn = args.hostInjectFn;
+                            this.#isHostOwned = args.hostOwned;
+                        }}
+
+                        streamTableIdx() {{ return this.#streamTableIdx; }}
+                        setStreamTableIdx(idx) {{ this.#streamTableIdx = idx; }}
+
+                        handle() {{ return this.#handle; }}
+                        setHandle(h) {{ this.#handle = h; }}
+
+                        globalStreamMapRep() {{ return this.#globalStreamMapRep; }}
+                        setGlobalStreamMapRep(rep) {{ this.#globalStreamMapRep = rep; }}
+
+                        waitableIdx() {{ return this.getWaitable().idx(); }}
+                        setWaitableIdx(idx) {{
+                            const w = this.getWaitable();
+                            w.setIdx(idx);
+                            w.setTarget(`waitable for {rw_fn_name} end (waitable [${{idx}}])`);
+                        }}
+
+                        setHostInjectFn(f) {{
+                            if (this.#hostInjectFn) {{ throw new Error('host injection fn is already set'); }}
+                            this.#hostInjectFn = f;
+                        }}
+                        setHostDropFn(f) {{
+                            if (this.#hostDropFn) {{ throw new Error('host drop fn is already set'); }}
+                            this.#hostDropFn = f;
+                        }}
+                        setHostCancelFn(f) {{ this.#hostCancelFn = f; }}
+                        hasHostInject() {{ return !!this.#hostInjectFn; }}
+                        setSourceRebufferFn(f) {{ this.#sourceRebufferFn = f; }}
+
+                        getElemMeta() {{ return {{...this.#elemMeta}}; }}
+
+                        {type_getter_impl}
+
+                        isDoneState() {{ return this.getCopyState() === {stream_end_class}.CopyState.DONE; }}
+                        isCancelledState() {{ return this.getCopyState() === {stream_end_class}.CopyState.CANCELLED; }}
+                        isIdleState() {{ return this.getCopyState() === {stream_end_class}.CopyState.IDLE; }}
+
+                        {action_impl}
+                        {inner_rw_impl}
+                        {copy_setup_impl}
+                        {copy_impl}
+
+                        setPendingBufferMeta(args) {{
+                            const {{ componentIdx, buffer, onCopyFn, onCopyDoneFn, rejectLength, dropAfterCopy }} = args;
+                            this.#pendingBufferMeta.componentIdx = componentIdx;
+                            this.#pendingBufferMeta.buffer = buffer;
+                            this.#pendingBufferMeta.onCopyFn = onCopyFn;
+                            this.#pendingBufferMeta.onCopyDoneFn = onCopyDoneFn;
+                            this.#pendingBufferMeta.rejectLength = rejectLength;
+                            this.#pendingBufferMeta.dropAfterCopy = dropAfterCopy;
+                        }}
+
+                        resetPendingBufferMeta() {{
+                            this.setPendingBufferMeta({{ componentIdx: null, buffer: null, onCopyFn: null, onCopyDoneFn: null, rejectLength: undefined, dropAfterCopy: false }});
+                        }}
+
+                        getPendingBufferMeta() {{ return this.#pendingBufferMeta; }}
+                        hasPendingBuffer() {{ return !!this.#pendingBufferMeta?.buffer; }}
+
+                        resetAndNotifyPending(result) {{
+                            const f = this.#pendingBufferMeta.onCopyDoneFn;
+                            this.resetPendingBufferMeta();
+                            if (f) {{ f(result); }}
+                        }}
+
+                        cancel() {{
+                            {debug_log_fn}('[{stream_end_class}#cancel()]');
+                            const completeCancel = () => {{
+                                if (this.isDropped()) {{ return; }}
+                                // Host injection may complete the copy before this deferred
+                                // cancellation runs. Preserve that completion event instead of
+                                // cancelling the next operation or starting a duplicate write.
+                                if (this.hasPendingEvent()) {{ return; }}
+                                if (this.#hostCancelFn?.()) {{ return; }}
+                                this.resetAndNotifyPending({stream_end_class}.CopyResult.CANCELLED);
+                            }};
+                            if (this.#hostInjectFn) {{
+                                // The deferral is runtime work the guest is waiting on: a task
+                                // suspended in a synchronous cancel resumes only when it runs.
+                                // Count it like a host operation so a deadlock check scheduled
+                                // before this timer does not report the wait as a deadlock.
+                                {track_host_operation}(() => new Promise((resolve) => {{
+                                    setTimeout(() => {{
+                                        try {{ completeCancel(); }} finally {{ resolve(); }}
+                                    }}, 0);
+                                }}));
+                            }} else {{
+                                completeCancel();
+                            }}
+                        }}
+
+                        drop(opts = {{}}) {{
+                            {debug_log_fn}('[{stream_end_class}#drop()]');
+                            if (this.isDropped()) {{ return; }}
+                            const hostDropFn = this.#hostDropFn;
+                            this.#hostDropFn = null;
+                            super.drop(opts);
+                            // A source drop hook can re-enter the component, so both ends must
+                            // observe the drop before the hook (which is deferred) wakes a waiting writer.
+                            if (hostDropFn) {{ hostDropFn(); }}
+                            if (this.#pendingBufferMeta) {{
+                                this.resetAndNotifyPending({stream_end_class}.CopyResult.DROPPED);
+                            }}
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::InternalStreamClass => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let internal_stream_class_name = self.name();
+                let read_end_class = render_args.require_intrinsic(Self::StreamReadableEndClass);
+                let write_end_class = render_args.require_intrinsic(Self::StreamWritableEndClass);
+
+                output.push_str(&format!(
+                    r#"
+                    class {internal_stream_class_name} {{
+                        #pendingBufferMeta = {{}}; // shared between read/write ends
+                        #elemMeta;
+
+                        #globalStreamMapRep;
+
+                        #readEnd;
+                        #writeEnd;
+
+                        constructor(args) {{
+                            {debug_log_fn}('[{internal_stream_class_name}#constructor()] args', args);
+                            if (!args.elemMeta) {{ throw new Error('missing/invalid stream element metadata'); }}
+                            if (args.tableIdx === undefined) {{ throw new Error('missing/invalid stream table idx'); }}
+                            if (!args.readWaitable) {{ throw new Error('missing/invalid read waitable'); }}
+                            if (!args.writeWaitable) {{ throw new Error('missing/invalid write waitable'); }}
+                            const {{ tableIdx, elemMeta, readWaitable, writeWaitable, }} = args;
+
+                            this.#elemMeta = elemMeta;
+
+                            this.#readEnd = new {read_end_class}({{
+                                tableIdx,
+                                elemMeta: this.#elemMeta,
+                                pendingBufferMeta: this.#pendingBufferMeta,
+                                target: "stream read end (@ init)",
+                                waitable: readWaitable,
+                                // Only in-component read-ends need the host inject fn if provided,
+                                // as that function will *inject* a write when a read is performed
+                                // from inside the guest.
+                                hostInjectFn: args.hostInjectFn,
+                                isPeerDroppedFn: () => this.#writeEnd?.isDropped() ?? false,
+                                notifyPeerDroppedFn: () => this.#writeEnd?.notifyDropped(),
+                            }});
+
+                            this.#writeEnd = new {write_end_class}({{
+                                tableIdx,
+                                elemMeta: this.#elemMeta,
+                                pendingBufferMeta: this.#pendingBufferMeta,
+                                target: "stream write end (@ init)",
+                                waitable: writeWaitable,
+                                hostOwned: true,
+                                isPeerDroppedFn: () => this.#readEnd.isDropped(),
+                                notifyPeerDroppedFn: () => this.#readEnd.notifyDropped(),
+                            }});
+                        }}
+
+                        elemMeta() {{ return this.#elemMeta; }}
+
+                        globalStreamMapRep() {{ return this.#globalStreamMapRep; }}
+                        setGlobalStreamMapRep(rep) {{
+                            this.#globalStreamMapRep = rep;
+                            this.#readEnd.setGlobalStreamMapRep(rep);
+                            this.#writeEnd.setGlobalStreamMapRep(rep);
+                        }}
+
+                        readEnd() {{ return this.#readEnd; }}
+                        writeEnd() {{ return this.#writeEnd; }}
+                    }}
+                    "#
+                ));
+            }
+
+            // The host stream class is used exclusively *inside* the host implementation,
+            // to represent stream that have been lifted (or originated) external to a given
+            // component.
+            //
+            // For example, after a component-internal stream is lifted from a component (normally
+            // by way of returning it from a function), that stream will have been made into a host
+            // stream, and *may* give actual end users access via the `createUserStream()` function.
+            //
+            // At present since streams can only give away the read-end, this usually means that the
+            // host stream will be used to often give away the *read* end.
+            //
+            Self::HostStreamClass => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let host_stream_class_name = self.name();
+                let get_stream_end_fn = render_args.require_intrinsic(Self::GetStreamEnd);
+                let external_stream_class =
+                    render_args.require_intrinsic(Self::ExternalStreamClass);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+
+                output.push_str(&format!(
+                    r#"
+                    class {host_stream_class_name} {{
+                        #componentIdx;
+                        #streamEndWaitableIdx;
+                        #streamTableIdx;
+
+                        #payloadLiftFn;
+                        #payloadLowerFn;
+
+                        #userStream;
+
+                        #rep = null;
+
+                        constructor(args) {{
+                            {debug_log_fn}('[{host_stream_class_name}#constructor()] args', args);
+                            if (args.componentIdx === undefined) {{ throw new TypeError("missing component idx"); }}
+                            this.#componentIdx = args.componentIdx;
+
+                            if (!args.payloadLiftFn) {{ throw new TypeError("missing payload lift fn"); }}
+                            this.#payloadLiftFn = args.payloadLiftFn;
+
+                            if (!args.payloadLowerFn) {{ throw new TypeError("missing payload lower fn"); }}
+                            this.#payloadLowerFn = args.payloadLowerFn;
+
+                            if (args.streamEndWaitableIdx === undefined) {{ throw new Error("missing stream idx"); }}
+                            if (args.streamTableIdx === undefined) {{ throw new Error("missing stream table idx"); }}
+                            this.#streamEndWaitableIdx = args.streamEndWaitableIdx;
+                            this.#streamTableIdx = args.streamTableIdx;
+                        }}
+
+                        setRep(rep) {{ this.#rep = rep; }}
+                        getStreamEndWaitableIdx() {{ return this.#streamEndWaitableIdx; }}
+
+                        createUserStream() {{
+                           if (this.#userStream) {{ return this.#userStream; }}
+                           if (this.#rep === null) {{ throw new Error("unexpectedly missing rep for host stream"); }}
+
+                           const cstate = {get_or_create_async_state_fn}(this.#componentIdx);
+                           if (!cstate) {{ throw new Error(`missing async state for component [${{this.#componentIdx}}]`); }}
+
+                           const streamEnd = {get_stream_end_fn}({{
+                               tableIdx: this.#streamTableIdx,
+                               streamEndWaitableIdx: this.#streamEndWaitableIdx
+                           }});
+                           if (!streamEnd) {{
+                               throw new Error(`missing stream [${{this.#streamEndWaitableIdx}}] (table [${{this.#streamTableIdx}}], component [${{this.#componentIdx}}]`);
+                           }}
+                           if (streamEnd.isDoneState()) {{
+                               throw new {runtime_error_class}('cannot lift stream after being notified that the writable end dropped');
+                           }}
+                           if (streamEnd.isInSet()) {{ throw new {runtime_error_class}({CANNOT_LIFT_STREAM_IN_WAITABLE_SET:?}); }}
+
+                            return new {external_stream_class}({{
+                                isReadable: streamEnd.isReadable(),
+                                isWritable: streamEnd.isWritable(),
+                                globalRep: this.#rep,
+                                readFn: async (opts) => {{
+                                    return await streamEnd.read(opts);
+                                }},
+                                writeFn: async (v) => {{
+                                    await streamEnd.write(v);
+                                }},
+                                // The host may dispose while an already-completed read is
+                                // between event publication and its polling continuation.
+                                // Preserve that event for the in-flight host promise.
+                                dropFn: () => streamEnd.drop({{ allowPendingEvent: true }}),
+                            }});
+                        }}
+                    }}
+                    "#
+                ));
+            }
+
+            Self::PendingValueQueueClass => {
+                let pending_value_queue_class = self.name();
+                let track_host_operation =
+                    render_args.require_intrinsic(ComponentIntrinsic::TrackHostOperation);
+
+                output.push_str(&format!(
+                    r#"
+                      class {pending_value_queue_class} {{
+                          #readFn;
+                          #elemMeta;
+                          #done = false;
+                          #sourceReadPromise = null;
+                          #chunks = [];
+                          #offset = 0;
+                          #length = 0;
+
+                          constructor(readFn, elemMeta) {{
+                              this.#readFn = readFn;
+                              this.#elemMeta = elemMeta;
+                          }}
+
+                          get length() {{ return this.#length; }}
+                          get done() {{ return this.#done; }}
+                          get sourceIsSync() {{ return !!this.#readFn.sourceIsSync; }}
+
+                          push(source) {{
+                              if (source.length === 0) {{ return 0; }}
+                              this.#chunks.push(source);
+                              this.#length += source.length;
+                              return source.length;
+                          }}
+
+                          appendReadValue(value) {{
+                              if (value === undefined) {{ return 0; }}
+                              if (this.#elemMeta.isNumeric) {{
+                                  if (value instanceof ArrayBuffer) {{
+                                      value = new Uint8Array(value);
+                                  }}
+                                  if (Array.isArray(value) || (ArrayBuffer.isView(value) && typeof value.length === 'number')) {{
+                                      return this.push(value);
+                                  }}
+                              }}
+                              return this.push([value]);
+                          }}
+
+                          async readSource() {{
+                              if (!this.#sourceReadPromise) {{
+                                  this.#sourceReadPromise = (async () => {{
+                                      const res = await {track_host_operation}(() => this.#readFn());
+                                      const appended = this.appendReadValue(res.value);
+                                      this.#done = res.done;
+                                      return appended;
+                                  }})().finally(() => {{
+                                      this.#sourceReadPromise = null;
+                                  }});
+                              }}
+                              return this.#sourceReadPromise;
+                          }}
+
+                          prepend(source) {{
+                              if (source.length === 0) {{ return; }}
+                              if (this.#offset !== 0 && this.#chunks.length > 0) {{
+                                  this.#chunks[0] = this.#chunks[0].slice(this.#offset);
+                                  this.#offset = 0;
+                              }}
+                              this.#chunks.unshift(source);
+                              this.#length += source.length;
+                          }}
+
+                          drainInto(target, maxCount) {{
+                              let transferred = 0;
+                              let remaining = Math.min(maxCount, this.#length);
+                              while (remaining > 0) {{
+                                  const chunk = this.#chunks[0];
+                                  const transfer = Math.min(remaining, chunk.length - this.#offset);
+                                  for (let i = 0; i < transfer; i++) {{
+                                      target.push(chunk[this.#offset + i]);
+                                  }}
+                                  this.#offset += transfer;
+                                  this.#length -= transfer;
+                                  transferred += transfer;
+                                  remaining -= transfer;
+                                  if (this.#offset === chunk.length) {{
+                                      this.#chunks.shift();
+                                      this.#offset = 0;
+                                  }}
+                              }}
+                              return transferred;
+                          }}
+                      }}
+                    "#
+                ));
+            }
+
+            // NOTE: this stream class is meant to be given to external users and can be passed along
+            // to the outside world.
+            //
+            // Functions that return streams should return *this* stream class, and functions that accept
+            // streams should return this stream class.
+            //
+            // TODO(fix): move this stream class to an external @bytecodealliance/p3-runtime package for
+            // reuse from inside and outside.
+            //
+            // TODO(fix): remove host stream rep tracking, force this on the host to maintain as metadata.
+            //
+            Self::ExternalStreamClass => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let external_stream_class_name = self.name();
+                let symbol_dispose = render_args.require_intrinsic(Intrinsic::SymbolDispose);
+                let symbol_async_iterator =
+                    render_args.require_intrinsic(Intrinsic::SymbolAsyncIterator);
+                let symbol_cabi_rep = render_args.require_intrinsic(Intrinsic::SymbolResourceRep);
+
+                output.push_str(&format!(
+                    r#"
+                    class {external_stream_class_name} {{
+                        #globalRep = null;
+                        #isReadable;
+                        #isWritable;
+                        #writeFn;
+                        #readFn;
+                        #dropFn;
+
+                        constructor(args) {{
+                            {debug_log_fn}('[{external_stream_class_name}#constructor()] args', args);
+
+                            if (args.globalRep === undefined) {{ throw new TypeError("missing host stream rep"); }}
+                            this[{symbol_cabi_rep}] = args.globalRep;
+
+                            if (args.isReadable === undefined) {{ throw new TypeError("missing readable setting"); }}
+                            this.#isReadable = args.isReadable;
+
+                            if (args.isWritable === undefined) {{ throw new TypeError("missing writable setting"); }}
+                            this.#isWritable = args.isWritable;
+
+                            if (this.#isWritable && args.writeFn === undefined) {{ throw new TypeError("missing write fn"); }}
+                            this.#writeFn = args.writeFn;
+
+                            if (this.#isReadable && args.readFn === undefined) {{ throw new TypeError("missing read fn"); }}
+                            this.#readFn = args.readFn;
+
+                            this.#dropFn = args.dropFn;
+                        }}
+
+                        [{symbol_async_iterator}]() {{ return this; }}
+
+                        async return() {{
+                            this[{symbol_dispose}]();
+                            return {{ done: true }};
+                        }}
+
+                        async next() {{
+                            {debug_log_fn}('[{external_stream_class_name}#next()]');
+                            return this.read();
+                        }}
+
+                        async read(opts) {{
+                            {debug_log_fn}('[{external_stream_class_name}#read()]', {{ opts }});
+                            if (!this.#isReadable) {{ throw new Error("stream is not marked as readable and cannot be read from"); }}
+                            const readOpts = this.#readOpts(opts);
+                            return this.#readFn(readOpts);
+                        }}
+
+                        #readOpts(opts) {{
+                            const count = opts === undefined ? 1 : typeof opts === "number" ? opts : opts && typeof opts === "object" ? opts.count ?? 1 : undefined;
+                            const rejectLength = opts && typeof opts === "object" ? opts.rejectLength : undefined;
+                            if (!Number.isInteger(count) || count < (rejectLength !== undefined ? 0 : 1)) {{ throw new TypeError(`invalid stream read count [${{count}}]`); }}
+                            if (rejectLength !== undefined && (!Number.isInteger(rejectLength) || rejectLength < 0)) {{
+                                throw new TypeError(`invalid stream read reject length [${{rejectLength}}]`);
+                            }}
+                            const dropAfterCopy = opts && typeof opts === "object" ? opts.dropAfterCopy === true : false;
+                            return {{ count, rejectLength, dropAfterCopy }};
+                        }}
+
+                        async write() {{
+                            {debug_log_fn}('[{external_stream_class_name}#write()]');
+                            if (!this.#isWritable) {{ throw new Error("stream is not marked as writable and cannot be written to"); }}
+
+                            const objects = [...arguments];
+                            if (!objects.length !== 1) {{
+                                throw new Error("only single object writes are currently supported");
+                            }}
+                            const obj = objects[0];
+
+                            this.#writeFn(obj);
+                        }}
+
+                        [{symbol_dispose}]() {{
+                            this.#dropFn?.();
+                        }}
+
+                    }}
+                    "#
+                ));
+            }
+
+            Self::GlobalStreamMap => {
+                let global_stream_map = render_args.require_intrinsic(Self::GlobalStreamMap);
+                let rep_table_class = render_args.require_intrinsic(Intrinsic::RepTableClass);
+                output.push_str(&format!(
+                    r#"
+                    const {global_stream_map} = new {rep_table_class}({{ target: 'global stream map' }});
+                    "#
+                ));
+            }
+
+            Self::GlobalStreamTableMap => {
+                let global_stream_table_map =
+                    render_args.require_intrinsic(Self::GlobalStreamTableMap);
+                output.push_str(&format!(
+                    r#"
+                    const {global_stream_table_map} = {{}};
+                    "#
+                ));
+            }
+
+            // TODO: allow customizable stream functionality (user should be able to specify a lib/import for a 'stream()' function
+            // (this will enable using p3-shim explicitly or any other implementation)
+            //
+            // NOTE: Unit streams are represented with a streamTypeRep of null
+            Self::StreamNew => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let stream_new_fn = render_args.require_intrinsic(Self::StreamNew);
+                let create_stream_fn = render_args.require_intrinsic(Self::CreateStream);
+                let current_task_get_fn = render_args
+                    .require_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                output.push_str(&format!(r#"
+                    function {stream_new_fn}(ctx) {{
+                        {debug_log_fn}('[{stream_new_fn}()] args', {{ ctx }});
+                        const {{
+                            streamTableIdx,
+                            callerComponentIdx,
+                            elemMeta,
+                        }} = ctx;
+                        if (callerComponentIdx === undefined) {{ throw new Error("missing caller component idx during stream.new"); }}
+
+                        const taskMeta = {current_task_get_fn}(callerComponentIdx);
+                        if (!taskMeta) {{ throw new Error('missing async task metadata during stream.new'); }}
+
+                        const task = taskMeta.task
+                        if (!task) {{ throw new Error('invalid/missing async task during stream.new'); }}
+
+                        if (task.componentIdx() !== callerComponentIdx) {{
+                            throw new Error(`task component idx [${{task.componentIdx()}}] does not match stream new intrinsic component idx [${{callerComponentIdx}}]`);
+                        }}
+
+                        const cstate = {get_or_create_async_state_fn}(callerComponentIdx);
+                        if (!cstate.mayLeave) {{
+                            throw new Error('component instance is not marked as may leave during stream.new');
+                        }}
+
+                        const {{ writeEndWaitableIdx, readEndWaitableIdx, writeEndHandle, readEndHandle }} = {create_stream_fn}(cstate, {{
+                            tableIdx: streamTableIdx,
+                            elemMeta,
+                        }});
+
+                        {debug_log_fn}('[{stream_new_fn}()] created stream ends', {{
+                            writeEnd: {{
+                                waitableIdx: writeEndWaitableIdx,
+                                handle: writeEndHandle,
+                            }},
+                            readEnd: {{
+                                waitableIdx: readEndWaitableIdx,
+                                handle: readEndHandle,
+                            }},
+                            streamTableIdx,
+                            callerComponentIdx,
+                        }});
+
+                        return (BigInt(writeEndWaitableIdx) << 32n) | BigInt(readEndWaitableIdx);
+                    }}
+                "#));
+            }
+
+            Self::StreamNewFromLift => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let stream_new_from_lift_fn = self.name();
+                let global_stream_map = render_args.require_intrinsic(Intrinsic::AsyncStream(
+                    AsyncStreamIntrinsic::GlobalStreamMap,
+                ));
+                let host_stream_class = render_args.require_intrinsic(Intrinsic::AsyncStream(
+                    AsyncStreamIntrinsic::HostStreamClass,
+                ));
+
+                output.push_str(&format!(
+                    r#"
+                    function {stream_new_from_lift_fn}(ctx) {{
+                        {debug_log_fn}('[{stream_new_from_lift_fn}()] args', {{ ctx }});
+                        const {{
+                            componentIdx,
+                            streamEndWaitableIdx,
+                            streamTableIdx,
+                            payloadLiftFn,
+                            payloadTypeSize32,
+                            payloadLowerFn,
+                        }} = ctx;
+
+                        const stream = new {host_stream_class}({{
+                            componentIdx,
+                            streamEndWaitableIdx,
+                            streamTableIdx,
+                            payloadLiftFn: payloadLiftFn,
+                            payloadLowerFn: payloadLowerFn,
+                        }});
+
+                        const rep = {global_stream_map}.insert(stream);
+                        stream.setRep(rep);
+
+                        return stream.createUserStream();
+                    }}
+                "#
+                ));
+            }
+
+            // NOTE: reads/writes are rendezvous based for P3, meaning that every write matches with a read.
+            //
+            // The pending buffer represents waiting write/read buffer.
+            //
+            Self::StreamWrite | Self::StreamRead => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let stream_op_fn = self.name();
+                let get_stream_end_fn = render_args.require_intrinsic(Self::GetStreamEnd);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let may_block =
+                    render_args.require_intrinsic(AsyncTaskIntrinsic::CurrentTaskMayBlock);
+                let async_event_code_enum =
+                    render_args.require_intrinsic(Intrinsic::AsyncEventCodeEnum);
+                let managed_buffer_class =
+                    render_args.require_intrinsic(Intrinsic::ManagedBufferClass);
+                let (event_code, stream_end_class) = match self {
+                    Self::StreamWrite => (
+                        format!("{async_event_code_enum}.STREAM_WRITE"),
+                        &render_args.require_intrinsic(Self::StreamWritableEndClass),
+                    ),
+                    Self::StreamRead => (
+                        format!("{async_event_code_enum}.STREAM_READ"),
+                        &render_args.require_intrinsic(Self::StreamReadableEndClass),
+                    ),
+                    _ => unreachable!("unexpected stream operation"),
+                };
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+
+                output.push_str(&format!(r#"
+                    function {stream_op_fn}(
+                        ctx,
+                        streamEndWaitableIdx,
+                        ptr,
+                        count,
+                    ) {{
+                        {debug_log_fn}('[{stream_op_fn}()] args', {{ ctx, streamEndWaitableIdx, ptr, count }});
+                        const {{
+                            componentIdx,
+                            memoryIdx,
+                            getMemoryFn,
+                            reallocIdx,
+                            getReallocFn,
+                            stringEncoding,
+                            isAsync,
+                            streamTableIdx,
+                            elemMeta,
+                            syncFastOnly,
+                            deferSyncFinish,
+                        }} = ctx;
+
+                        if (componentIdx === undefined) {{ throw new TypeError("missing/invalid component idx"); }}
+                        if (streamTableIdx === undefined) {{ throw new TypeError("missing/invalid stream table idx"); }}
+                        if (streamEndWaitableIdx === undefined) {{ throw new TypeError("missing/invalid stream end idx"); }}
+
+                        // pointers at or above 2GiB come in as negative values
+                        ptr >>>= 0;
+
+                        // count may come in as u32::MAX which is mangled by JS into a negative value
+                        count = Math.min(count >>> 0, {managed_buffer_class}.MAX_LENGTH);
+
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+                        if (!cstate.mayLeave) {{ throw new Error('component instance is not marked as may leave'); }}
+
+                        if (!{may_block} && !isAsync) {{
+                            throw new {runtime_error_class}('only async tasks or otherwise blocking-allowed tasks my stream.{stream_op_fn}');
+                        }}
+
+                        const streamEnd = {get_stream_end_fn}({{ tableIdx: streamTableIdx, streamEndWaitableIdx }});
+                        if (!streamEnd) {{
+                            throw new {runtime_error_class}(`missing stream end [${{streamEndWaitableIdx}}] (table [${{streamTableIdx}}], component [${{componentIdx}}])`);
+                        }}
+                        if (!(streamEnd instanceof {stream_end_class})) {{
+                            throw new {runtime_error_class}('invalid stream type, expected {stream_end_class}');
+                        }}
+                        if (streamEnd.streamTableIdx() !== streamTableIdx) {{
+                            throw new Error(`stream end table idx [${{streamEnd.streamTableIdx()}}] != operation table idx [${{streamTableIdx}}]`);
+                        }}
+                        if (streamEnd.isDoneState()) {{
+                            const message = streamEnd.isWritable()
+                                ? 'cannot write to stream after being notified that the readable end dropped'
+                                : 'cannot read from stream after being notified that the writable end dropped';
+                            throw new {runtime_error_class}(message);
+                        }}
+
+                        // A synchronous canonical operation is exposed through a
+                        // plain Wasm fast path so an already-queued event can be
+                        // consumed without entering JSPI. If it would block, the
+                        // generated conditional trampoline retries on its
+                        // suspending slow path.
+                        if (syncFastOnly
+                            && !streamEnd.hasPendingEvent()
+                            && !streamEnd.isPeerDropped()
+                            && !streamEnd.hasPendingBuffer()) {{
+                            // -2 tells the conditional trampoline to take its suspending
+                            // slow path (a synchronous copy must block, never report BLOCKED).
+                            return 0xFFFFFFFE;
+                        }}
+
+                        return streamEnd.copy({{
+                            isAsync,
+                            memory: getMemoryFn?.(),
+                            ptr,
+                            count,
+                            eventCode: {event_code},
+                            componentIdx,
+                            stringEncoding,
+                            realloc: getReallocFn?.(),
+                            getReallocFn,
+                            elemMeta,
+                            deferSyncFinish,
+                        }});
+                    }}
+                "#));
+            }
+
+            Self::StreamCancelRead | Self::StreamCancelWrite => {
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let async_blocked_const = render_args.require_intrinsic(Intrinsic::AsyncTask(
+                    AsyncTaskIntrinsic::AsyncBlockedConstant,
+                ));
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let stream_cancel_fn = self.name();
+                let get_stream_end_fn = render_args.require_intrinsic(Self::GetStreamEnd);
+                let is_cancel_write = matches!(self, Self::StreamCancelWrite);
+                let event_code_enum = format!(
+                    "{}.STREAM_{}",
+                    render_args.require_intrinsic(Intrinsic::AsyncEventCodeEnum),
+                    if is_cancel_write { "WRITE" } else { "READ" }
+                );
+                let stream_end_class = if is_cancel_write {
+                    render_args.require_intrinsic(Self::StreamWritableEndClass)
+                } else {
+                    render_args.require_intrinsic(Self::StreamReadableEndClass)
+                };
+                let current_task_get_fn = render_args
+                    .require_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                output.push_str(&format!(r#"
+                    function {stream_cancel_fn}(ctx, streamEndWaitableIdx) {{
+                        {debug_log_fn}('[{stream_cancel_fn}()] args', {{ ctx, streamEndWaitableIdx }});
+                        const {{ streamTableIdx, isAsync, componentIdx }} = ctx;
+
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+                        if (!cstate.mayLeave) {{ throw new Error('component instance is not marked as may leave'); }}
+
+                        const streamEnd = {get_stream_end_fn}({{ streamEndWaitableIdx, tableIdx: streamTableIdx }});
+                        if (!streamEnd) {{ throw new {runtime_error_class}('missing stream end with idx [' + streamEndWaitableIdx + ']'); }}
+                        if (!(streamEnd instanceof {stream_end_class})) {{ throw new Error('invalid stream end, expected value of type [{stream_end_class}]'); }}
+
+                        if (!streamEnd.isCopying()) {{ throw new Error('stream end is not copying, cannot cancel'); }}
+
+                        streamEnd.setCopyState({stream_end_class}.CopyState.CANCELLING_COPY);
+
+                        const finishCancel = () => {{
+                            const event = streamEnd.getPendingEvent();
+                            const {{ code, payload0: index, payload1: payload }} = event;
+                            if (streamEnd.isCopying()) {{
+                                throw new Error(`stream end (idx [${{streamEndWaitableIdx}}]) is still in copying state`);
+                            }}
+                            if (code !== {event_code_enum}) {{
+                                throw new Error(`unexpected event code [${{code}}], expected [{event_code_enum}]`);
+                            }}
+                            if (index !== streamEnd.waitableIdx()) {{ throw new Error('event index does not match stream end'); }}
+
+                            {debug_log_fn}('[{stream_cancel_fn}()] successful cancel', {{ ctx, streamEndWaitableIdx, streamEnd, event }});
+                            return payload;
+                        }};
+
+                        if (!streamEnd.hasPendingEvent()) {{
+                            streamEnd.cancel();
+
+                            if (!streamEnd.hasPendingEvent()) {{
+                                if (isAsync) {{ return {async_blocked_const}; }}
+
+                                const taskMeta = {current_task_get_fn}(componentIdx);
+                                if (!taskMeta) {{ throw new Error('missing current task metadata while doing stream transfer'); }}
+                                const task = taskMeta.task;
+                                if (!task) {{ throw new Error('missing task while doing stream transfer'); }}
+                                return task.suspendUntil({{
+                                    readyFn: () => streamEnd.hasPendingEvent(),
+                                }}).then(finishCancel);
+                            }}
+                        }}
+
+                        return finishCancel();
+                    }}
+                "#));
+            }
+
+            // NOTE: as writable drops are called from guests, they may happen *after*
+            // a host has tried to read off the end (i.e. getting back the async blocked constant),
+            // when running non-deterministrically (the default)
+            Self::StreamDropReadable | Self::StreamDropWritable => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let stream_drop_fn = self.name();
+                let get_stream_end_fn = render_args.require_intrinsic(Self::GetStreamEnd);
+                let delete_stream_end_fn = render_args.require_intrinsic(Self::DeleteStreamEnd);
+                let current_task_get_fn = render_args
+                    .require_intrinsic(Intrinsic::AsyncTask(AsyncTaskIntrinsic::GetCurrentTask));
+                let is_write = matches!(self, Self::StreamDropWritable);
+                let stream_end_class = if is_write {
+                    render_args.require_intrinsic(Self::StreamWritableEndClass)
+                } else {
+                    render_args.require_intrinsic(Self::StreamReadableEndClass)
+                };
+                let busy_error = if is_write {
+                    "cannot drop busy stream"
+                } else {
+                    "cannot remove busy stream"
+                };
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                output.push_str(&format!(r#"
+                    function {stream_drop_fn}(ctx, streamEndWaitableIdx) {{
+                        {debug_log_fn}('[{stream_drop_fn}()] args', {{ ctx, streamEndWaitableIdx }});
+                        const {{ streamTableIdx, componentIdx }} = ctx;
+
+                        const task = {current_task_get_fn}(componentIdx);
+                        if (!task) {{ throw new Error('invalid/missing async task'); }}
+
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+                        if (!cstate) {{ throw new Error(`missing component state for component idx [${{componentIdx}}]`); }}
+
+                        const streamEnd = {get_stream_end_fn}({{ tableIdx: streamTableIdx, streamEndWaitableIdx }});
+                        if (!streamEnd) {{
+                            throw new Error(`missing stream (waitable [${{streamEndWaitableIdx}}], table [${{streamTableIdx}}], component [${{componentIdx}}])`);
+                        }}
+
+                        if (!(streamEnd instanceof {stream_end_class})) {{
+                          throw new Error('invalid stream end class, expected [{stream_end_class}]');
+                        }}
+
+                        if (streamEnd.isCopying()) {{
+                            throw new {runtime_error_class}('{busy_error}');
+                        }}
+
+                        const removedStreamEnd = {delete_stream_end_fn}({{ tableIdx: streamTableIdx, streamEndWaitableIdx }});
+                        if (removedStreamEnd !== streamEnd) {{
+                            throw new Error('removed stream end does not match validated stream end');
+                        }}
+                        streamEnd.drop();
+                    }}
+                "#));
+            }
+
+            Self::StreamTransfer => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let stream_transfer_fn = self.name();
+                let get_stream_end_fn = render_args.require_intrinsic(Self::GetStreamEnd);
+                let remove_stream_end_from_table_fn =
+                    render_args.require_intrinsic(Self::RemoveStreamEndFromTable);
+                let add_stream_end_to_table_fn =
+                    render_args.require_intrinsic(Self::AddStreamEndToTable);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let global_stream_table_map =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::GlobalStreamTableMap);
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+
+                output.push_str(&format!(
+                    r#"
+                    function {stream_transfer_fn}(
+                        srcStreamWaitableIdx,
+                        srcTableIdx,
+                        destTableIdx,
+                    ) {{
+                        {debug_log_fn}('[{stream_transfer_fn}()] args', {{
+                            srcStreamWaitableIdx,
+                            srcTableIdx,
+                            destTableIdx,
+                        }});
+
+                        const streamMeta = {global_stream_table_map}[srcTableIdx];
+                        if (!streamMeta) {{ throw new Error('missing stream meta during transfer'); }}
+                        const componentIdx = streamMeta.componentIdx;
+
+                        // NOTE: no current-task lookup here: per the Canonical ABI the
+                        // transfer is a pure table operation between the source and
+                        // destination components' waitable tables. 
+                        // 
+                        // In particular, the return-position transfer of a fused *sync* guest->guest 
+                        // call runs after the callee task's teardown has already cleared the
+                        // per-component current-task register, so deriving task context
+                        // from the source stream's owning component is unsatisfiable
+                        // there.
+
+                        const cstate = {get_or_create_async_state_fn}(componentIdx);
+                        if (!cstate) {{ throw new Error(`missing async state for component [${{componentIdx}}]`); }}
+
+                        const streamEnd = {get_stream_end_fn}({{ tableIdx: srcTableIdx, streamEndWaitableIdx: srcStreamWaitableIdx }});
+                        if (!streamEnd.isReadable()) {{
+                            throw new Error("writable stream ends cannot be moved");
+                        }}
+                        if (streamEnd.isDoneState()) {{
+                            throw new {runtime_error_class}('cannot lift stream after being notified that the writable end dropped');
+                        }}
+                        if (streamEnd.isInSet()) {{
+                            throw new {runtime_error_class}({CANNOT_LIFT_STREAM_IN_WAITABLE_SET:?});
+                        }}
+
+                        const removedStreamEnd = {remove_stream_end_from_table_fn}({{ tableIdx: srcTableIdx, streamWaitableIdx: srcStreamWaitableIdx }});
+                        if (removedStreamEnd !== streamEnd) {{
+                            throw new Error('removed stream end does not match validated stream end');
+                        }}
+
+                        const {{ handle, waitableIdx }} = {add_stream_end_to_table_fn}({{ tableIdx: destTableIdx, streamEnd }});
+                        streamEnd.setTarget(`stream read end (waitable [${{waitableIdx}}])`);
+
+                        {debug_log_fn}('[{stream_transfer_fn}()] successfully transferred', {{
+                            dest: {{
+                                streamEndHandle: handle,
+                                streamEndWaitableIdx: waitableIdx,
+                                tableIdx: destTableIdx,
+                            }},
+                            src: {{
+                                streamEndWaitableIdx: srcStreamWaitableIdx,
+                                tableIdx: srcTableIdx,
+                            }},
+                            componentIdx,
+                        }});
+
+                        return waitableIdx;
+
+                      }}
+                "#
+                ));
+            }
+
+            Self::IsStreamLowerableObject => {
+                let is_stream_lowerable_object = self.name();
+                let external_stream_class =
+                    render_args.require_intrinsic(Self::ExternalStreamClass);
+                let async_iterator_symbol =
+                    render_args.require_intrinsic(Intrinsic::SymbolAsyncIterator);
+                let iterator_symbol = render_args.require_intrinsic(Intrinsic::SymbolIterator);
+                let external_readable_stream_class =
+                    render_args.require_intrinsic(Intrinsic::PlatformReadableStreamClass);
+
+                output.push_str(&format!(
+                    r#"
+                      function {is_stream_lowerable_object}(obj) {{
+                          if (typeof obj !== 'object') {{ return false; }}
+                          return obj instanceof {external_stream_class}
+                               || {async_iterator_symbol} in obj
+                               || {iterator_symbol} in obj
+                               || obj instanceof {external_readable_stream_class};
+                      }}
+                    "#
+                ));
+            }
+
+            Self::GenReadFnFromLowerableStream => {
+                let gen_read_fn_from_lowerable_stream = self.name();
+                let is_stream_lowerable_object =
+                    render_args.require_intrinsic(Self::IsStreamLowerableObject);
+                let async_iterator_symbol =
+                    render_args.require_intrinsic(Intrinsic::SymbolAsyncIterator);
+                let iterator_symbol = render_args.require_intrinsic(Intrinsic::SymbolIterator);
+                let external_readable_stream_class =
+                    render_args.require_intrinsic(Intrinsic::PlatformReadableStreamClass);
+                let dispose_host_value = render_args.require_intrinsic(Intrinsic::DisposeHostValue);
+
+                output.push_str(&format!(
+                    r#"
+                      function {gen_read_fn_from_lowerable_stream}(stream) {{
+                          if (!{is_stream_lowerable_object}(stream)) {{
+                              throw new Error("cannot generate read fn: object is not a stream lowerable object");
+                          }}
+
+                          let readFn;
+                          if ({async_iterator_symbol} in stream) {{
+                              let asyncIterator = stream[{async_iterator_symbol}]();
+                              readFn = () => asyncIterator.next();
+                              readFn.drop = (reason) => asyncIterator.return
+                                  ? {dispose_host_value}(asyncIterator, () => asyncIterator.return(reason))
+                                  : {dispose_host_value}(stream);
+                          }} else if ({iterator_symbol} in stream) {{
+                              let iterator = stream[{iterator_symbol}]();
+                              readFn = async () => iterator.next();
+                              readFn.drop = (reason) => iterator.return
+                                  ? {dispose_host_value}(iterator, () => iterator.return(reason))
+                                  : {dispose_host_value}(stream);
+                              // Synchronous sources can be drained eagerly (up to a
+                              // requested count) without risking an indefinite wait
+                              readFn.sourceIsSync = true;
+                          }} else if (stream instanceof {external_readable_stream_class}) {{
+                              // At this point we're dealing with a readable stream that *somehow *does not*
+                              // implement the async iterator protocol.
+                              const lockedReader = stream.getReader();
+                              readFn = () => lockedReader.read();
+                              readFn.drop = (reason) => {dispose_host_value}(
+                                  lockedReader,
+                                  () => lockedReader.cancel(reason).finally(() => lockedReader.releaseLock()),
+                              );
+                          }} else {{
+                              throw new Error("invalid stream object, cannot generate read fn");
+                          }}
+
+                          return readFn;
+                      }}
+                    "#
+                ));
+            }
+
+            Self::GenStreamHostInjectFn => {
+                let gen_host_inject_fn = self.name();
+                let pending_value_queue_class =
+                    render_args.require_intrinsic(Self::PendingValueQueueClass);
+
+                output.push_str(&format!(
+                    r#"
+                      function {gen_host_inject_fn}(genArgs) {{
+                          const {{ readFn, hostWriteEnd, readEnd }} = genArgs;
+                          if (!readEnd) {{ throw new TypeError('missing read end'); }}
+                          const doNothingFn = () => {{}};
+                          const resetWriteEndToIdleFn = () => {{
+                              // After the write is finished, we consume the event that was generated
+                              // by the just-in-time write (and the subsequent read), if one was generated
+                              if (hostWriteEnd.hasPendingEvent()) {{ hostWriteEnd.getPendingEvent(); }}
+                          }};
+
+                          const elemMeta = hostWriteEnd.getElemMeta();
+
+                          const pendingValues = new {pending_value_queue_class}(readFn, elemMeta);
+                          hostWriteEnd.setSourceRebufferFn?.((items) => pendingValues.prepend(items));
+
+                          return async function generatedStreamHostInject(args) {{
+                              let {{ count }} = args;
+                              if (count < 0) {{ throw new Error('invalid count'); }}
+                              if (readEnd.hasPendingEvent()) {{ return resetWriteEndToIdleFn; }}
+
+                              if (hostWriteEnd.isDoneState()) {{
+                                  return doNothingFn;
+                              }}
+
+                              const values = [];
+                              const hasPendingReadBuffer = () => !!readEnd.getPendingBufferMeta?.().buffer;
+
+                              const drainPendingValues = () => {{
+                                  count -= pendingValues.drainInto(values, count);
+                              }};
+
+                              const writeValues = async (writeValues, dropAfterCopy = false) => {{
+                                  // The previous injected write's completion event is consumed lazily,
+                                  // and consuming it is what returns the write end to idle. A guest
+                                  // that issues reads back to back within one slice can start the next
+                                  // injected write before that happens, which would fail as a
+                                  // concurrent operation and leave the read with no completion.
+                                  resetWriteEndToIdleFn();
+                                  const writePromise = hostWriteEnd.writeMany(writeValues, {{ dropAfterCopy }});
+                                  if (hostWriteEnd.hasPendingEvent()) {{
+                                      void writePromise.catch(() => {{}});
+                                  }} else {{
+                                      await writePromise;
+                                  }}
+                                  resetWriteEndToIdleFn();
+                              }};
+
+                              const bail = () => {{
+                                  pendingValues.prepend(values);
+                                  return doNothingFn;
+                              }};
+
+                              readEnd.setHostCancelFn?.(() => {{
+                                  const buffer = readEnd.getPendingBufferMeta?.().buffer;
+                                  if (!buffer || pendingValues.length === 0) {{ return false; }}
+                                  const cancelValues = [];
+                                  pendingValues.drainInto(cancelValues, buffer.remaining());
+                                  if (cancelValues.length === 0) {{ return false; }}
+                                  resetWriteEndToIdleFn();
+                                  const writePromise = hostWriteEnd.writeMany(cancelValues);
+                                  if (!hostWriteEnd.hasPendingEvent()) {{
+                                      pendingValues.prepend(cancelValues);
+                                      return false;
+                                  }}
+                                  void writePromise.catch(() => {{}});
+                                  resetWriteEndToIdleFn();
+                                  return true;
+                              }});
+
+                              if (!hasPendingReadBuffer()) {{ return doNothingFn; }}
+                              if (count === 0) {{
+                                  if (pendingValues.length === 0 && !pendingValues.done) {{
+                                      await pendingValues.readSource();
+                                      if (readEnd.hasPendingEvent() || !hasPendingReadBuffer()) {{ return doNothingFn; }}
+                                  }}
+                                  if (pendingValues.length > 0) {{
+                                      // Readiness signal for a zero-length read: complete it with zero
+                                      // items rather than draining/buffering one (which the wasmtime
+                                      // host contract warns can be lost, and which stores a pending
+                                      // write that corrupts the next read's rendezvous).
+                                      readEnd.resetAndNotifyPending(readEnd.constructor.CopyResult.COMPLETED);
+                                  }} else if (pendingValues.done) {{
+                                      hostWriteEnd.getPendingEvent();
+                                      hostWriteEnd.drop();
+                                  }}
+                                  return doNothingFn;
+                              }}
+                              drainPendingValues();
+
+                              while (count > 0 && !pendingValues.done) {{
+                                  const appended = await pendingValues.readSource();
+                                  if (readEnd.hasPendingEvent()) {{ return bail(); }}
+                                  if (!hasPendingReadBuffer()) {{ return bail(); }}
+                                  drainPendingValues();
+                                  // Deliver data as soon as any is available rather than
+                                  // waiting on the source for a full count -- except for
+                                  // synchronous sources, which can be drained eagerly
+                                  // without waiting
+                                  if (values.length > 0 && !pendingValues.sourceIsSync) {{ break; }}
+                                  if (appended === 0 && !pendingValues.done) {{ count -= 1; }}
+                                  if (pendingValues.done) {{ break; }}
+                              }}
+
+                              // Iterator provided `done: true` with no final value
+                              if (pendingValues.done && values.length === 0 && pendingValues.length > 0 && hasPendingReadBuffer()) {{
+                                  drainPendingValues();
+                              }}
+                              if (pendingValues.done && values.length === 0) {{
+                                  hostWriteEnd.getPendingEvent();
+                                  hostWriteEnd.drop();
+                                  return doNothingFn;
+                              }}
+
+                              if (!hasPendingReadBuffer()) {{ return bail(); }}
+                              await writeValues(values, pendingValues.done);
+
+                              return doNothingFn;
+                          }};
+                      }}
+                    "#
+                ));
+            }
+        }
+    }
+}

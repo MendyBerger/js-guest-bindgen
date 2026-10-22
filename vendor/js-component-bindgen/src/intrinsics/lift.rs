@@ -1,0 +1,1554 @@
+//! Intrinsics that represent helpers that enable Lift integration
+use std::fmt::Write;
+
+use crate::intrinsics::component::ComponentIntrinsic;
+use crate::intrinsics::p3::async_future::AsyncFutureIntrinsic;
+use crate::intrinsics::p3::async_stream::AsyncStreamIntrinsic;
+use crate::intrinsics::p3::error_context::ErrCtxIntrinsic;
+use crate::intrinsics::p3::{
+    CANNOT_LIFT_FUTURE_IN_WAITABLE_SET, CANNOT_LIFT_STREAM_IN_WAITABLE_SET,
+};
+use crate::intrinsics::string::StringIntrinsic;
+use crate::intrinsics::{Intrinsic, RenderIntrinsicsArgs};
+use crate::source::Source;
+use crate::uwriteln;
+
+use super::conversion::ConversionIntrinsic;
+
+/// This enum contains intrinsics that enable Lift
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub enum LiftIntrinsic {
+    /// Lift a boolean into provided storage, given a core type
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value.
+    LiftFlatBool,
+
+    /// Lift a s8 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -128 to 127.
+    LiftFlatS8,
+
+    /// Lift a u8 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 255.
+    LiftFlatU8,
+
+    /// Lift a s16 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -32,768 to 32,767.
+    LiftFlatS16,
+
+    /// Lift a u16 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 65,535.
+    LiftFlatU16,
+
+    /// Lift a s32 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -2,147,483,648 to 2,147,483,647.
+    LiftFlatS32,
+
+    /// Lift a u32 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 4,294,967,295.
+    LiftFlatU32,
+
+    /// Lift a s64 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807
+    LiftFlatS64,
+
+    /// Lift a u64 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    ///
+    /// In this case, coreVals is expected to contain precisely *one* numerical (u32-equivalent) value,
+    /// which is bounded from 0 to 18,446,744,073,709,551,615.
+    LiftFlatU64,
+
+    /// Lift a f32 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    LiftFlatFloat32,
+
+    /// Lift a f64 into provided storage given core type(s)
+    ///
+    /// This function is of the form:
+    ///
+    /// ```ts
+    /// type u32 = number;
+    /// (coreVals: u32[], ptr: u32, len: u32) => void;
+    /// ```
+    LiftFlatFloat64,
+
+    /// Lift a char into provided storage given core type(s) that represent utf8
+    LiftFlatChar,
+
+    /// Lift a string from provided storage given core type(s), using encoding in lfit ctx
+    LiftFlatStringAny,
+
+    /// Lift a UTF8 string into provided storage given core type(s)
+    LiftFlatStringUtf8,
+
+    /// Lift a UTF16 string into provided storage given core type(s)
+    LiftFlatStringUtf16,
+
+    /// Lift a record into provided storage given core type(s)
+    LiftFlatRecord,
+
+    /// Lift a variant into provided storage given core type(s)
+    LiftFlatVariant,
+
+    /// Lift a list into provided storage given core type(s)
+    LiftFlatList,
+
+    /// Lift a map into provided storage given core type(s)
+    LiftFlatMap,
+
+    /// Lift a tuple into provided storage given core type(s)
+    LiftFlatTuple,
+
+    /// Lift flags into provided storage given core type(s)
+    LiftFlatFlags,
+
+    /// Lift flags into provided storage given core type(s)
+    LiftFlatEnum,
+
+    /// Lift an option into provided storage given core type(s)
+    LiftFlatOption,
+
+    /// Lift a result into provided storage given core type(s)
+    LiftFlatResult,
+
+    /// Lift a owned resource into provided storage given core type(s)
+    LiftFlatOwn,
+
+    /// Lift a borrowed resource into provided storage given core type(s)
+    LiftFlatBorrow,
+
+    /// Lift a future into provided storage given core type(s)
+    LiftFlatFuture,
+
+    /// Lift a stream into provided storage given core type(s)
+    LiftFlatStream,
+
+    /// Lift an error-context into provided storage given core type(s)
+    LiftFlatErrorContext,
+}
+
+impl LiftIntrinsic {
+    /// Retrieve global names for
+    pub fn get_global_names() -> impl IntoIterator<Item = &'static str> {
+        []
+    }
+
+    /// Get the name for the intrinsic
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::LiftFlatBool => "_liftFlatBool",
+            Self::LiftFlatS8 => "_liftFlatS8",
+            Self::LiftFlatU8 => "_liftFlatU8",
+            Self::LiftFlatS16 => "_liftFlatS16",
+            Self::LiftFlatU16 => "_liftFlatU16",
+            Self::LiftFlatS32 => "_liftFlatS32",
+            Self::LiftFlatU32 => "_liftFlatU32",
+            Self::LiftFlatS64 => "_liftFlatS64",
+            Self::LiftFlatU64 => "_liftFlatU64",
+            Self::LiftFlatFloat32 => "_liftFlatFloat32",
+            Self::LiftFlatFloat64 => "_liftFlatFloat64",
+            Self::LiftFlatChar => "_liftFlatChar",
+            Self::LiftFlatStringAny => "_liftFlatStringAny",
+            Self::LiftFlatStringUtf8 => "_liftFlatStringUTF8",
+            Self::LiftFlatStringUtf16 => "_liftFlatStringUTF16",
+            Self::LiftFlatRecord => "_liftFlatRecord",
+            Self::LiftFlatVariant => "_liftFlatVariant",
+            Self::LiftFlatList => "_liftFlatList",
+            Self::LiftFlatMap => "_liftFlatMap",
+            Self::LiftFlatTuple => "_liftFlatTuple",
+            Self::LiftFlatFlags => "_liftFlatFlags",
+            Self::LiftFlatEnum => "_liftFlatEnum",
+            Self::LiftFlatOption => "_liftFlatOption",
+            Self::LiftFlatResult => "_liftFlatResult",
+            Self::LiftFlatOwn => "_liftFlatOwn",
+            Self::LiftFlatBorrow => "_liftFlatBorrow",
+            Self::LiftFlatFuture => "_liftFlatFuture",
+            Self::LiftFlatStream => "_liftFlatStream",
+            Self::LiftFlatErrorContext => "_liftFlatErrorContext",
+        }
+    }
+
+    /// Render an intrinsic to a string
+    pub fn render(&self, output: &mut Source, render_args: &RenderIntrinsicsArgs<'_>) {
+        match self {
+            Self::LiftFlatBool => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_bool_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_bool_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_bool_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least a single i32 argument'); }}
+                            val = ctx.params[0] === 1;
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 1) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (bool requires 1 byte)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getUint8(ctx.storagePtr, true) === 1;
+
+                        ctx.storagePtr += 1;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 1; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatS8 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_s8_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_s8_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_s8_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least a single i32 argument'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 1) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (s8 requires 1 byte)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getInt8(ctx.storagePtr, true);
+                        ctx.storagePtr += 1;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 1; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatU8 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_u8_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_u8_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_u8_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least a single i32 argument'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 1) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (u8 requires 1 byte)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getUint8(ctx.storagePtr, true);
+
+                        ctx.storagePtr += 1;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 1; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatS16 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_s16_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_s16_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_s16_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least a single i32 argument'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 2) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (s16 requires 2 bytes)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getInt16(ctx.storagePtr, true);
+                        ctx.storagePtr += 2;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 2; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatU16 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_u16_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_u16_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_u16_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least a single i32 argument'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 2) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (u16 requires 2 bytes)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getUint16(ctx.storagePtr, true);
+
+                        ctx.storagePtr += 2;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 2; }}
+
+                        const rem = ctx.storagePtr % 2;
+                        if (rem !== 0) {{ ctx.storagePtr += (2 - rem); }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatS32 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_s32_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_s32_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_s32_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least a single i32 argument'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 4) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (s32 requires 4 bytes)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getInt32(ctx.storagePtr, true);
+                        ctx.storagePtr += 4;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 4; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatU32 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_u32_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_u32_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_u32_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least a single i34 argument'); }}
+                            // core i32 values arrive as signed numbers
+                            val = ctx.params[0] >>> 0;
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 4) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (u32 requires 4 bytes)`);
+                        }}
+                        val = new DataView(ctx.memory.buffer).getUint32(ctx.storagePtr, true);
+                        ctx.storagePtr += 4;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 4; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatS64 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_s64_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_s64_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_s64_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least one single i64 argument'); }}
+                            if (typeof ctx.params[0] !== 'bigint') {{ throw new Error('expected bigint'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 8) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (s64 requires 8 bytes)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getBigInt64(ctx.storagePtr, true);
+                        ctx.storagePtr += 8;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 8; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatU64 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_u64_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_u64_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_u64_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least one single i64 argument'); }}
+                            if (typeof ctx.params[0] !== 'bigint') {{ throw new Error('expected bigint'); }}
+                            // core i64 values arrive as signed BigInts
+                            val = BigInt.asUintN(64, ctx.params[0]);
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 8) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (u64 requires 8 bytes)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getBigUint64(ctx.storagePtr, true);
+                        ctx.storagePtr += 8;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 8; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatFloat32 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_f32_fn = self.name();
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_f32_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_f32_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least one single f32 argument'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 4) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (f32 requires 4 bytes)`);
+                        }}
+
+                        val = new DataView(ctx.memory.buffer).getFloat32(ctx.storagePtr, true);
+
+                        ctx.storagePtr += 4;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 4; }}
+
+                        return [val, ctx];
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatFloat64 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_f64_fn = self.name();
+                uwriteln!(
+                    output,
+                    r#"
+                      function {lift_flat_f64_fn}(ctx) {{
+                          {debug_log_fn}('[{lift_flat_f64_fn}()] args', {{ ctx }});
+                          let val;
+
+                          if (ctx.useDirectParams) {{
+                              if (ctx.params.length === 0) {{
+                                  throw new Error('expected at least one single f64 argument');
+                              }}
+                              val = ctx.params[0];
+                              ctx.params = ctx.params.slice(1);
+
+                              return [val, ctx];
+                          }}
+
+                          if (ctx.storageLen !== undefined && ctx.storageLen < 8) {{
+                              throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (f64 requires 8 bytes)`);
+                          }}
+
+                          val = new DataView(ctx.memory.buffer).getFloat64(ctx.storagePtr, true);
+                          ctx.storagePtr += 8;
+                          if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 8; }}
+
+                          return [val, ctx];
+                      }}
+                "#
+                );
+            }
+
+            Self::LiftFlatChar => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let i32_to_char_fn = render_args
+                    .require_intrinsic(Intrinsic::Conversion(ConversionIntrinsic::I32ToChar));
+                let lift_flat_char_fn = self.name();
+                output.push_str(&format!("
+                    function {lift_flat_char_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_char_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least one single i32 argument'); }}
+                            val = {i32_to_char_fn}(ctx.params[0]);
+                            ctx.params = ctx.params.slice(1);
+                            return [val, ctx];
+                        }}
+
+                        if (ctx.storageLen !== undefined && ctx.storageLen < 4) {{
+                            throw new Error(`insufficient storage ([${{ctx.storageLen}}] bytes) for lift (char requires 4 bytes)`);
+                        }}
+
+                        val = {i32_to_char_fn}(new DataView(ctx.memory.buffer).getUint32(ctx.storagePtr, true));
+                        ctx.storagePtr += 4;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 4; }}
+
+                        return [val, ctx];
+                    }}
+                "));
+            }
+
+            Self::LiftFlatStringAny => {
+                let lift_flat_string_any_fn = self.name();
+                let lift_flat_string_utf8_fn =
+                    render_args.require_intrinsic(Self::LiftFlatStringUtf8);
+                let lift_flat_string_utf16_fn =
+                    render_args.require_intrinsic(Self::LiftFlatStringUtf16);
+                output.push_str(&format!(r#"
+                    function {lift_flat_string_any_fn}(ctx) {{
+                        switch (ctx.stringEncoding) {{
+                            case 'utf8':
+                                return {lift_flat_string_utf8_fn}(ctx);
+                            case 'utf16':
+                                return {lift_flat_string_utf16_fn}(ctx);
+                            default:
+                                throw new Error(`missing/unrecognized/unsupported string encoding [${{ctx.stringEncoding}}]`);
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LiftFlatStringUtf8 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let decoder = render_args
+                    .require_intrinsic(Intrinsic::String(StringIntrinsic::GlobalTextDecoderUtf8));
+                let lift_flat_string_utf8_fn = self.name();
+
+                output.push_str(&format!(r#"
+                    function {lift_flat_string_utf8_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_string_utf8_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length < 2) {{ throw new Error('expected at least two u32 arguments'); }}
+                            let offset = ctx.params[0];
+                            if (typeof offset === 'bigint') {{ offset = Number(offset); }} else {{ offset >>>= 0; }}
+                            if (!Number.isSafeInteger(offset)) {{ throw new Error('invalid offset'); }}
+                            const len = ctx.params[1];
+                            if (!Number.isSafeInteger(len)) {{  throw new Error('invalid len'); }}
+                            val = {decoder}.decode(new DataView(ctx.memory.buffer, offset, len));
+                            ctx.params = ctx.params.slice(2);
+                            return [val, ctx];
+                        }}
+
+                        const rem = ctx.storagePtr % 4;
+                        if (rem !== 0) {{ ctx.storagePtr += (4 - rem); }}
+
+                        const dv = new DataView(ctx.memory.buffer);
+                        const start = dv.getUint32(ctx.storagePtr, true);
+                        const codeUnits = dv.getUint32(ctx.storagePtr + 4, true);
+
+                        val = {decoder}.decode(new Uint8Array(ctx.memory.buffer, start, codeUnits));
+
+                        ctx.storagePtr += 8;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 8; }}
+
+                        return [val, ctx];
+                    }}
+                "#));
+            }
+
+            Self::LiftFlatStringUtf16 => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let decoder =
+                    render_args.require_intrinsic(Intrinsic::String(StringIntrinsic::Utf16Decoder));
+                let lift_flat_string_utf16_fn = self.name();
+                output.push_str(&format!("
+                    function {lift_flat_string_utf16_fn}(ctx) {{
+                        {debug_log_fn}('[{lift_flat_string_utf16_fn}()] args', {{ ctx }});
+                        let val;
+
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length < 2) {{ throw new Error('expected at least two u32 arguments'); }}
+                            let offset = ctx.params[0];
+                            if (typeof offset === 'bigint') {{ offset = Number(offset); }} else {{ offset >>>= 0; }}
+                            if (!Number.isSafeInteger(offset)) {{  throw new Error('invalid offset'); }}
+                            const len = ctx.params[1];
+                            if (!Number.isSafeInteger(len)) {{  throw new Error('invalid len'); }}
+                            val = {decoder}.decode(new DataView(ctx.memory.buffer, offset, len * 2));
+                            ctx.params = ctx.params.slice(2);
+                            return [val, ctx];
+                        }}
+
+                        const rem = ctx.storagePtr % 4;
+                        if (rem !== 0) {{ ctx.storagePtr += (4 - rem); }}
+
+                        const dv = new DataView(ctx.memory.buffer);
+                        const start = dv.getUint32(ctx.storagePtr, true);
+                        const codeUnits = dv.getUint32(ctx.storagePtr + 4, true);
+
+                        val = {decoder}.decode(new DataView(ctx.memory.buffer, start, codeUnits * 2));
+
+                        ctx.storagePtr += 8;
+                        if (ctx.storageLen !== undefined) {{ ctx.storageLen -= 8; }}
+
+                        return [val, ctx];
+                    }}
+                "));
+            }
+
+            Self::LiftFlatRecord => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_record_fn = self.name();
+                output.push_str(&format!(
+                    r#"
+                    function {lift_flat_record_fn}(meta) {{
+                        const {{ fieldMetas, size32: recordSize32, align32: recordAlign32 }} = meta;
+                        return function {lift_flat_record_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_record_fn}()] args', {{ ctx }});
+
+                            const originalPtr = ctx.storagePtr;
+                            const res = {{}};
+                            for (const [key, liftFn, size32, align32] of fieldMetas) {{
+                                let fieldPtr;
+                                if (ctx.storagePtr !== undefined) {{
+                                    const rem = ctx.storagePtr % align32;
+                                    if (rem !== 0) {{ ctx.storagePtr += align32 - rem; }}
+                                    fieldPtr = ctx.storagePtr;
+                                }}
+
+                                // A field occupies exactly size32 bytes of the record's
+                                // flat storage. Capture the remaining storage budget before
+                                // lifting the field and restore it afterwards: a field's own
+                                // lift fn may repurpose storageLen internally (e.g. a list
+                                // sets it to the element-buffer length while reading
+                                // out-of-line data and never restores it), which would
+                                // otherwise corrupt the budget the next field sees.
+                                // See https://github.com/bytecodealliance/jco/issues/1585.
+                                let fieldLen;
+                                if (ctx.storageLen !== undefined) {{ fieldLen = ctx.storageLen; }}
+
+                                let [val, newCtx] = liftFn(ctx);
+                                res[key] = val;
+                                ctx = newCtx;
+
+                                if (fieldPtr !== undefined) {{
+                                    ctx.storagePtr = Math.max(ctx.storagePtr, fieldPtr + size32);
+                                }}
+                                if (fieldLen !== undefined) {{
+                                    ctx.storageLen = fieldLen - size32;
+                                }}
+                            }}
+
+                            if (originalPtr !== undefined) {{
+                                ctx.storagePtr = Math.max(ctx.storagePtr, originalPtr + recordSize32);
+                            }}
+
+                            if (ctx.storagePtr !== undefined) {{
+                                const rem = ctx.storagePtr % recordAlign32;
+                                if (rem !== 0) {{ ctx.storagePtr += recordAlign32 - rem; }}
+                            }}
+
+                            return [res, ctx];
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            Self::LiftFlatVariant => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_variant_fn = self.name();
+                let lift_u8 = render_args.require_intrinsic(Self::LiftFlatU8);
+                let lift_u16 = render_args.require_intrinsic(Self::LiftFlatU16);
+                let lift_u32 = render_args.require_intrinsic(Self::LiftFlatU32);
+
+                output.push_str(&format!(r#"
+                    const {lift_flat_variant_fn}Scratch = new DataView(new ArrayBuffer(8));
+
+                    function {lift_flat_variant_fn}(meta) {{
+                        const {{
+                            caseMetas,
+                            variantSize32,
+                            variantAlign32,
+                            variantPayloadOffset32,
+                            variantFlatCount,
+                            variantPayloadFlatTypes,
+                            isEnum,
+                        }} = meta;
+
+                        return function {lift_flat_variant_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_variant_fn}()] args', {{ ctx }});
+                            const origUseParams = ctx.useDirectParams;
+
+                            let caseIdx;
+                            let liftRes;
+                            const originalPtr = ctx.storagePtr;
+                            const numCases =  caseMetas.length;
+                            if (caseMetas.length < 256) {{
+                                liftRes = {lift_u8}(ctx);
+                            }} else if (numCases >= 256 && numCases < 65536) {{
+                                liftRes = {lift_u16}(ctx);
+                            }} else if (numCases >= 65536 && numCases < 4_294_967_296) {{
+                                liftRes = {lift_u32}(ctx);
+                            }} else {{
+                                throw new Error(`unsupported number of variant cases [${{numCases}}]`);
+                            }}
+                            caseIdx = liftRes[0];
+                            ctx = liftRes[1];
+
+                            const [
+                                tag,
+                                liftFn,
+                                caseSize32,
+                                caseAlign32,
+                                caseFlatCount,
+                                caseFlatTypes,
+                            ] = caseMetas[caseIdx];
+
+                            if (variantPayloadOffset32 === undefined) {{
+                               throw new Error('unexpectedly missing payload offset');
+                            }}
+
+                            if (originalPtr !== undefined) {{
+                                ctx.storagePtr = originalPtr + variantPayloadOffset32;
+                            }}
+
+                            let val;
+                            if (liftFn === null) {{
+                                val = {{ tag }};
+                                // NOTE: here we need to move past the entire object in memory
+                                // despite moving to the payload which we now know is missing/unnecessary
+                                if (originalPtr !== undefined) {{
+                                    ctx.storagePtr = originalPtr + variantSize32;
+                                }}
+                            }} else {{
+                                // When lifting from direct params, the payload arrives as the
+                                // *join* of all case flat representations: each slot whose
+                                // joined core type differs from the selected case's core type
+                                // must be reinterpreted before the payload lift
+                                // (see CanonicalABI `lift_flat_variant`)
+                                if (ctx.useDirectParams) {{
+                                    if (!variantPayloadFlatTypes || !caseFlatTypes) {{
+                                        throw new Error('missing variant flat type metadata during direct-param lift');
+                                    }}
+                                    const scratch = {lift_flat_variant_fn}Scratch;
+                                    for (let i = 0; i < caseFlatTypes.length; i++) {{
+                                        const have = variantPayloadFlatTypes[i];
+                                        const want = caseFlatTypes[i];
+                                        if (have === want) {{ continue; }}
+                                        const val = ctx.params[i];
+                                        if (have === 'i64' && want === 'i32') {{
+                                            ctx.params[i] = Number(BigInt.asIntN(32, val));
+                                        }} else if (have === 'i64' && want === 'f32') {{
+                                            scratch.setInt32(0, Number(BigInt.asIntN(32, val)), true);
+                                            ctx.params[i] = scratch.getFloat32(0, true);
+                                        }} else if (have === 'i64' && want === 'f64') {{
+                                            scratch.setBigInt64(0, val, true);
+                                            ctx.params[i] = scratch.getFloat64(0, true);
+                                        }} else if (have === 'i32' && want === 'f32') {{
+                                            scratch.setInt32(0, val, true);
+                                            ctx.params[i] = scratch.getFloat32(0, true);
+                                        }} else {{
+                                            throw new Error(`invalid variant payload coercion [${{have}}] -> [${{want}}]`);
+                                        }}
+                                    }}
+                                }}
+
+                                const [newVal, newCtx] = liftFn(ctx);
+                                val = {{ tag, val: newVal }};
+                                ctx = newCtx;
+                            }}
+
+                            if (origUseParams) {{
+                                if (variantFlatCount === undefined || variantFlatCount === null) {{
+                                    {debug_log_fn}('[{lift_flat_variant_fn}()] variant with unknown flat count', {{ ctx, meta }});
+                                    throw new Error('cannot lift variant with unknown flat count');
+                                }}
+                                if (caseFlatCount === undefined || caseFlatCount === null) {{
+                                    {debug_log_fn}('[{lift_flat_variant_fn}()] case with unknown flat count', {{ ctx, meta, case: meta.caseMetas[caseIdx] }});
+                                    throw new Error('cannot lift case with unknown flat count');
+                                }}
+                                // NOTE: enums can be tightly packed and do not have a descriminant
+                                const remainingPayloadParams = variantFlatCount - caseFlatCount - (isEnum ? 0 : 1);
+                                if (remainingPayloadParams < 0) {{
+                                    throw new Error(`invalid variant flat count metadata`);
+                                }}
+                                if (ctx.params.length < remainingPayloadParams) {{
+                                    throw new Error(`expected at least [${{remainingPayloadParams}}] remaining variant payload params, but got [${{ctx.params.length}}]`);
+                                }}
+                                ctx.params = ctx.params.slice(remainingPayloadParams);
+                            }}
+
+                            if (ctx.storagePtr !== undefined) {{
+                                const rem = ctx.storagePtr % variantAlign32;
+                                if (rem !== 0) {{ ctx.storagePtr += variantAlign32 - rem; }}
+                            }}
+
+                            return [val, ctx];
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LiftFlatList => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_list_fn = self.name();
+                let lift_u32 = render_args.require_intrinsic(Self::LiftFlatU32);
+                let runtime_error =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+
+                output.push_str(&format!(r#"
+                    function {lift_flat_list_fn}(meta) {{
+                        const {{ elemLiftFn, elemSize32, elemAlign32, knownLen, typedArray }} = meta;
+
+                        const listValue =
+                          typedArray === undefined
+                            ? values => values
+                            : values => new typedArray(values);
+
+                        const readValuesAndReset = (ctx, originalPtr, originalLen, dataPtr, len) => {{
+                            if (
+                                dataPtr < 0 || len < 0 ||
+                                (elemSize32 !== 0 && len > Math.floor(((1 << 28) - 1) / elemSize32)) ||
+                                dataPtr > ctx.memory.buffer.byteLength ||
+                                (elemSize32 !== 0 && len > Math.floor((ctx.memory.buffer.byteLength - dataPtr) / elemSize32))
+                            ) {{
+                                throw new {runtime_error}('wasm trap: out of bounds memory access');
+                            }}
+                            if (dataPtr % elemAlign32 !== 0) {{
+                                throw new TypeError(`list pointer [${{dataPtr}}] is not aligned to ${{elemAlign32}}`);
+                            }}
+                            ctx.storagePtr = dataPtr;
+                            const val = [];
+                            for (var i = 0; i < len; i++) {{
+                                const elemPtr = dataPtr + i * elemSize32;
+                                ctx.storagePtr = elemPtr;
+                                const [res, nextCtx] = elemLiftFn(ctx);
+                                val.push(res);
+                                ctx = nextCtx;
+
+                                ctx.storagePtr = Math.max(ctx.storagePtr, elemPtr + elemSize32);
+                            }}
+                            if (originalPtr !== null) {{ ctx.storagePtr = originalPtr; }}
+                            if (originalLen !== null) {{ ctx.storageLen = originalLen; }}
+                            return [listValue(val), ctx];
+                        }};
+
+                        return function {lift_flat_list_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_list_fn}()] args', {{ ctx }});
+
+                            let liftResults;
+                            if (knownLen !== undefined) {{ // list with known length
+                                if (ctx.useDirectParams) {{
+                                    {debug_log_fn}('memory unexpectedly missing while lifting unknown length list', {{ ctx }});
+                                    liftResults = [listValue(ctx.params.slice(0, knownLen)), ctx];
+                                    ctx.params = ctx.params.slice(knownLen);
+                                }} else {{ // indirect params
+                                    if (ctx.memory === null) {{
+                                        {debug_log_fn}('memory unexpectedly missing while lifting known length list', {{ knownLen, ctx }});
+                                        throw new Error(`memory missing while lifting known length (${{knownLen}}) list`);
+                                    }}
+
+                                    const originalLen = ctx.storageLen;
+                                    const originalPtr = ctx.storagePtr;
+
+                                    ctx.storageLen = knownLen * elemSize32;
+                                    liftResults = readValuesAndReset(ctx, null, originalLen, ctx.storagePtr, knownLen);
+                                }}
+
+                            }} else {{ // unknown length list
+
+                                if (ctx.useDirectParams) {{
+                                    // unknown length list ptr w/ direct params
+                                    const dataPtr = ctx.params[0] >>> 0;
+                                    const len = ctx.params[1];
+                                    ctx.params = ctx.params.slice(2);
+
+                                    ctx.useDirectParams = false;
+                                    const originalPtr = ctx.storagePtr;
+                                    const originalLen = ctx.storageLen;
+                                    ctx.storageLen = len * elemSize32;
+
+                                    liftResults = readValuesAndReset(ctx, originalPtr, originalLen, dataPtr, len);
+
+                                    ctx.useDirectParams = true;
+                                }} else {{
+                                    // unknown length list ptr w/ in-memory params
+                                    const originalLen = ctx.storageLen;
+                                    ctx.storageLen = 8;
+
+                                    const dataPtrLiftRes = {lift_u32}(ctx);
+                                    const dataPtr = dataPtrLiftRes[0];
+                                    ctx = dataPtrLiftRes[1];
+
+                                    const lenLiftRes = {lift_u32}(ctx);
+                                    const len = lenLiftRes[0];
+                                    ctx = lenLiftRes[1];
+
+                                    const originalPtr = ctx.storagePtr;
+                                    ctx.storagePtr = dataPtr;
+
+                                    ctx.storageLen = len * elemSize32;
+                                    liftResults = readValuesAndReset(ctx, originalPtr, originalLen, dataPtr, len);
+                                }}
+                            }}
+
+                            return liftResults;
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LiftFlatMap => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_map_fn = self.name();
+                let lift_u32 = render_args.require_intrinsic(Self::LiftFlatU32);
+
+                output.push_str(&format!(r#"
+                    function {lift_flat_map_fn}(meta) {{
+                        const {{ keyLiftFn, valueLiftFn, entrySize32, valueOffset32 }} = meta;
+
+                        const readEntriesAndReset = (ctx, originalPtr, originalLen, dataPtr, len) => {{
+                            const val = new Map();
+                            for (let i = 0; i < len; i++) {{
+                                const entryPtr = dataPtr + i * entrySize32;
+                                ctx.storagePtr = entryPtr;
+                                const [key, keyCtx] = keyLiftFn(ctx);
+                                ctx = keyCtx;
+                                ctx.storagePtr = entryPtr + valueOffset32;
+                                const [value, valueCtx] = valueLiftFn(ctx);
+                                ctx = valueCtx;
+                                val.set(key, value);
+                            }}
+                            if (originalPtr !== null) {{ ctx.storagePtr = originalPtr; }}
+                            if (originalLen !== null) {{ ctx.storageLen = originalLen; }}
+                            return [val, ctx];
+                        }};
+
+                        return function {lift_flat_map_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_map_fn}()] args', {{ ctx }});
+
+                            let dataPtr;
+                            let len;
+                            let originalPtr = ctx.storagePtr;
+                            const originalLen = ctx.storageLen;
+                            if (ctx.useDirectParams) {{
+                                dataPtr = ctx.params[0] >>> 0;
+                                len = ctx.params[1];
+                                ctx.params = ctx.params.slice(2);
+                            }} else {{
+                                ctx.storageLen = 8;
+                                let lifted = {lift_u32}(ctx);
+                                dataPtr = lifted[0];
+                                ctx = lifted[1];
+                                lifted = {lift_u32}(ctx);
+                                len = lifted[0];
+                                ctx = lifted[1];
+                                originalPtr = ctx.storagePtr;
+                            }}
+
+                            const wasDirect = ctx.useDirectParams;
+                            ctx.useDirectParams = false;
+                            ctx.storageLen = len * entrySize32;
+                            const result = readEntriesAndReset(ctx, originalPtr, originalLen, dataPtr, len);
+                            result[1].useDirectParams = wasDirect;
+                            return result;
+                        }}
+                    }}
+                "#));
+            }
+
+            Self::LiftFlatTuple => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_tuple_fn = self.name();
+                output.push_str(&format!(
+                    "
+                    function {lift_flat_tuple_fn}(meta) {{
+                        const {{ elemLiftFns, size32: tupleSize32, align32: tupleAlign32 }} = meta;
+                        return function {lift_flat_tuple_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_tuple_fn}()] args', {{ ctx }});
+
+                            const originalPtr = ctx.storagePtr;
+                            const val = [];
+                            for (const [ liftFn, size32, align32 ]  of elemLiftFns) {{
+                                let elemPtr;
+                                if (ctx.storagePtr !== undefined) {{
+                                    const rem = ctx.storagePtr % align32;
+                                    if (rem !== 0) {{ ctx.storagePtr += align32 - rem; }}
+                                    elemPtr = ctx.storagePtr;
+                                }}
+
+                                // As in _liftFlatRecord: an element occupies exactly size32
+                                // bytes of the tuple's flat storage, so capture and restore
+                                // the storage budget around the element lift to stop a
+                                // field's internal storageLen use (e.g. lists) leaking into
+                                // the next element.
+                                // See https://github.com/bytecodealliance/jco/issues/1585.
+                                let elemLen;
+                                if (ctx.storageLen !== undefined) {{ elemLen = ctx.storageLen; }}
+
+                                const [newValue, newCtx] = liftFn(ctx);
+                                val.push(newValue);
+                                ctx = newCtx;
+
+                                if (elemPtr !== undefined) {{
+                                    ctx.storagePtr = Math.max(ctx.storagePtr, elemPtr + size32);
+                                }}
+                                if (elemLen !== undefined) {{
+                                    ctx.storageLen = elemLen - size32;
+                                }}
+                            }}
+
+                            if (originalPtr !== undefined) {{
+                                ctx.storagePtr = Math.max(ctx.storagePtr, originalPtr + tupleSize32);
+                            }}
+
+                            if (ctx.storagePtr !== undefined) {{
+                                const rem = ctx.storagePtr % tupleAlign32;
+                                if (rem !== 0) {{ ctx.storagePtr += tupleAlign32 - rem; }}
+                            }}
+
+                            return [val, ctx];
+                        }}
+                    }}
+                "
+                ));
+            }
+
+            // NOTE: enums are returned as the string tag that would normally
+            // e.g. `{tag: 'member0' }` -> `'member0'`
+            Self::LiftFlatEnum => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_variant = render_args.require_intrinsic(Self::LiftFlatVariant);
+                let lift_flat_enum_fn = self.name();
+                output.push_str(&format!(
+                    r#"
+                    function {lift_flat_enum_fn}(meta) {{
+                        meta.isEnum = true;
+                        const f = {lift_variant}(meta);
+                        return function {lift_flat_enum_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_enum_fn}()] args', {{ ctx }});
+                            const res = f(ctx);
+                            res[0] = res[0].tag;
+                            return res;
+                        }}
+                    }}
+                    "#
+                ));
+            }
+
+            Self::LiftFlatOption => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_variant = render_args.require_intrinsic(Self::LiftFlatVariant);
+                let lift_flat_option_fn = self.name();
+                output.push_str(&format!(
+                    r#"
+                    function {lift_flat_option_fn}(meta) {{
+                        const {{ payloadMaybeNull }} = meta;
+                        const f = {lift_variant}(meta);
+                        return function {lift_flat_option_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_option_fn}()] args', {{ ctx }});
+                            const res = f(ctx);
+                            if (!payloadMaybeNull) {{
+                                res[0] = res[0].tag === 'none' ? undefined : res[0].val;
+                            }}
+                            return res;
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            Self::LiftFlatResult => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_variant = render_args.require_intrinsic(Self::LiftFlatVariant);
+                let lift_flat_result_fn = self.name();
+                output.push_str(&format!(
+                    r#"
+                    function {lift_flat_result_fn}(meta) {{
+                        const f = {lift_variant}(meta);
+                        return function {lift_flat_result_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_result_fn}()] args', {{ ctx }});
+                            const res = f(ctx);
+                            if (!('val' in res[0])) {{ res[0].val = undefined; }}
+                            return res;
+                        }}
+                    }}
+                    "#
+                ));
+            }
+
+            Self::LiftFlatFlags => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_flags_fn = self.name();
+                let lift_u8 = render_args.require_intrinsic(Self::LiftFlatU8);
+                let lift_u16 = render_args.require_intrinsic(Self::LiftFlatU16);
+                let lift_u32 = render_args.require_intrinsic(Self::LiftFlatU32);
+                let init_value = if render_args.transpile_opts.flags_as_bigint {
+                    "null"
+                } else {
+                    "{}"
+                };
+                let finish_value = if render_args.transpile_opts.flags_as_bigint {
+                    "val = BigInt(bits >>> 0);"
+                } else {
+                    r#"
+                            for (const name of names) {
+                                val[name] = (bits & 1) === 1;
+                                bits >>>= 1;
+                            }
+                    "#
+                };
+
+                output.push_str(&format!(
+                    r#"
+                    function {lift_flat_flags_fn}(meta) {{
+                        const {{ names, size32, align32, intSizeBytes }} = meta;
+
+                        return function {lift_flat_flags_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_flags_fn}()] args', {{ ctx }});
+
+                            let val = {init_value};
+
+                            let liftRes;
+                            let align;
+                            switch (intSizeBytes) {{
+                                case 1:
+                                    liftRes = {lift_u8}(ctx);
+                                    break;
+                                case 2:
+                                    liftRes = {lift_u16}(ctx);
+                                    break;
+                                case 4:
+                                    liftRes = {lift_u32}(ctx);
+                                    break;
+                                default:
+                                    throw new Error('invalid flags size');
+                            }}
+                            let bits = liftRes[0];
+                            ctx = liftRes[1];
+
+                            {finish_value}
+
+                            const rem = ctx.storagePtr % align32;
+                            if (rem !== 0) {{ ctx.storagePtr += align32 - rem; }}
+
+                            return [val, ctx];
+                        }}
+                    }}
+                    "#
+                ));
+            }
+
+            Self::LiftFlatOwn => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_own_fn = self.name();
+                let lift_flat_u32_fn = render_args.require_intrinsic(Self::LiftFlatU32);
+
+                // NOTE: meta carries the resource class behind a thunk
+                // (`classNameFn`), never as a direct reference: lift metadata
+                // is evaluated eagerly at module top level (e.g. inside
+                // taskReturn trampoline binds), which may run before the
+                // resource class declaration and TDZ-throw.
+                output.push_str(&format!(
+                    r#"
+                    function {lift_flat_own_fn}(meta) {{
+                        const {{ classNameFn, createResourceFn, componentIdx, tableIdx }} = meta;
+
+                        return function {lift_flat_own_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_own_fn}()] args', {{ ctx, className: classNameFn() }});
+
+                            if (ctx.componentIdx !== componentIdx) {{
+                                throw new Error('invalid component for resource lift');
+                            }}
+
+                            const [handle, newCtx] = {lift_flat_u32_fn}(ctx);
+                            const resource = ctx.liftResource
+                                ? ctx.liftResource(handle, tableIdx)
+                                : createResourceFn(handle);
+
+                            return [resource, newCtx];
+                        }}
+                    }}
+                "#
+                ));
+            }
+
+            Self::LiftFlatBorrow => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_borrow_fn = self.name();
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_borrow_fn}(componentTableIdx, size, memory, vals, storagePtr, storageLen) {{
+                        {debug_log_fn}('[{lift_flat_borrow_fn}()] args', {{ size, memory, vals, storagePtr, storageLen }});
+                        throw new Error('flat lift for borrowed resources is not supported!');
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatFuture => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let lift_flat_future_fn = self.name();
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let global_future_table_map =
+                    render_args.require_intrinsic(AsyncFutureIntrinsic::GlobalFutureTableMap);
+                let lift_u32 = render_args.require_intrinsic(Self::LiftFlatU32);
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let get_future_end_fn =
+                    render_args.require_intrinsic(AsyncFutureIntrinsic::GetFutureEnd);
+
+                uwriteln!(
+                    output,
+                    r#"
+                    function {lift_flat_future_fn}(meta) {{
+                        const {{
+                            futureTableIdx,
+                            componentIdx,
+                        }} = meta;
+
+                        return function {lift_flat_future_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_future_fn}()] args', {{ ctx }});
+
+                            const futureMeta = {global_future_table_map}[futureTableIdx];
+                            if (futureMeta.componentIdx !== componentIdx) {{
+                                throw new Error('unexpectedly mismatched component idx');
+                            }}
+                            const {{ table }} = futureMeta;
+                            if (componentIdx === undefined || !table) {{
+                                throw new Error(`invalid global future table state for table [${{tableIdx}}]`);
+                            }}
+
+                            let futureEndWaitableIdx;
+                            if (ctx.useDirectParams) {{
+                                futureEndWaitableIdx = ctx.params[0];
+                                ctx.params = ctx.params.slice(1);
+                            }} else {{
+                                const [waitableIdx, newCtx] = {lift_u32}(ctx);
+                                ctx = newCtx;
+                                futureEndWaitableIdx = waitableIdx;
+                            }}
+
+                            if (futureEndWaitableIdx === undefined) {{ throw new Error('missing future idx'); }}
+
+                            const cstate = {get_or_create_async_state_fn}(componentIdx);
+                            if (!cstate) {{ throw new Error(`missing async state for component [${{componentIdx}}]`); }}
+
+                            const futureEnd = {get_future_end_fn}({{ tableIdx: futureTableIdx, futureEndWaitableIdx }});
+                            if (!futureEnd) {{
+                                throw new Error(`missing future end [${{futureEndWaitableIdx}}] (table [${{futureTableIdx}}]) in component [${{componentIdx}}] during lift`);
+                            }}
+
+                            if (ctx.isBorrowed) {{ throw new Error('cannot lift flat future of borrowed type'); }}
+                            if (futureEnd.isWritable()) {{ throw new Error('only readable futures can be lifted'); }}
+                            if (futureEnd.isDoneState()) {{
+                                throw new {runtime_error_class}('cannot lift future after previous read succeeded');
+                            }}
+                            if (!futureEnd.isIdleState()) {{ throw new Error('futures must be in idle state'); }}
+                            if (futureEnd.isInSet()) {{ throw new {runtime_error_class}({CANNOT_LIFT_FUTURE_IN_WAITABLE_SET:?}); }}
+
+                            return [ futureEnd.promise(), ctx ];
+                        }};
+                    }}
+                "#
+                );
+            }
+
+            Self::LiftFlatStream => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+                let external_stream_class = render_args.require_intrinsic(Intrinsic::AsyncStream(
+                    AsyncStreamIntrinsic::ExternalStreamClass,
+                ));
+                let lift_flat_stream_fn = self.name();
+                let global_stream_table_map =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::GlobalStreamTableMap);
+                let lift_u32 = render_args.require_intrinsic(Self::LiftFlatU32);
+                let runtime_error_class =
+                    render_args.require_intrinsic(Intrinsic::WebAssemblyRuntimeError);
+                let get_stream_end_fn =
+                    render_args.require_intrinsic(AsyncStreamIntrinsic::GetStreamEnd);
+
+                output.push_str(&format!(r#"
+                    function {lift_flat_stream_fn}(meta) {{
+                        const {{
+                            streamTableIdx,
+                            componentIdx,
+                        }} = meta;
+
+                        return function {lift_flat_stream_fn}Inner(ctx) {{
+                            {debug_log_fn}('[{lift_flat_stream_fn}()] args', {{ ctx }});
+
+                            const streamMeta = {global_stream_table_map}[streamTableIdx];
+                            if (streamMeta.componentIdx !== componentIdx) {{
+                                throw new Error('unexpectedly mismatched component idx');
+                            }}
+                            const {{ table }} = streamMeta;
+                            if (componentIdx === undefined || !table) {{
+                                throw new Error(`invalid global stream table state for table [${{tableIdx}}]`);
+                            }}
+
+                            let streamEndWaitableIdx;
+                            if (ctx.useDirectParams) {{
+                                streamEndWaitableIdx = ctx.params[0];
+                                ctx.params = ctx.params.slice(1);
+                            }} else {{
+                                const [waitableIdx, newCtx] = {lift_u32}(ctx);
+                                ctx = newCtx;
+                                streamEndWaitableIdx = waitableIdx;
+                            }}
+
+                            if (!streamEndWaitableIdx) {{ throw new Error('missing stream idx'); }}
+
+                            const cstate = {get_or_create_async_state_fn}(componentIdx);
+                            if (!cstate) {{ throw new Error(`missing async state for component [${{componentIdx}}]`); }}
+
+                            const streamEnd = {get_stream_end_fn}({{ tableIdx: streamTableIdx, streamEndWaitableIdx }});
+                            if (!streamEnd) {{
+                                throw new Error(`missing stream end [${{streamEndWaitableIdx}}] (table [${{streamTableIdx}}]) in component [${{componentIdx}}] during lift`);
+                            }}
+
+                            if (ctx.isBorrowed) {{ throw new Error('cannot lift flat stream of borrowed type'); }}
+                            if (streamEnd.isWritable()) {{ throw new Error('only readable streams can be lifted'); }}
+                            if (streamEnd.isDoneState()) {{
+                                throw new {runtime_error_class}('cannot lift stream after being notified that the writable end dropped');
+                            }}
+                            if (!streamEnd.isIdleState()) {{ throw new Error('streams must be in idle state'); }}
+                            if (streamEnd.isInSet()) {{ throw new {runtime_error_class}({CANNOT_LIFT_STREAM_IN_WAITABLE_SET:?}); }}
+
+                            const stream = new {external_stream_class}({{
+                                globalRep: streamEnd.globalStreamMapRep(),
+                                isReadable: streamEnd.isReadable(),
+                                isWritable: streamEnd.isWritable(),
+                                writeFn: (v) => {{ return streamEnd.write(v); }},
+                                readFn: (opts) => {{ return streamEnd.read(opts); }},
+                                // A host can dispose an in-flight read after its event has
+                                // been published but before its polling continuation consumes
+                                // it. Detach the endpoint without discarding that completion.
+                                dropFn: () => {{ return streamEnd.drop({{ allowPendingEvent: true }}); }},
+                            }});
+
+                            return [ stream, ctx ];
+                        }}
+                    }}
+                "#));
+            }
+
+            // Since error contexts are reference counted, when one is lifted from a component to a
+            // component model value, we assume that the host has taken control of it until it has been lowered
+            // into a component
+            //
+            // When we lift an error context, we increase the global ref count as it must be accounted for
+            // at the component model (host) level.
+            //
+            // This means that *before* lifting an error context object's `val` property represents a local
+            // handle (an index into a component-local error context table), but *after* lifting, it represents
+            // a component-global "rep" (i.e. the component model represenation).
+            //
+            Self::LiftFlatErrorContext => {
+                let debug_log_fn = render_args.require_intrinsic(Intrinsic::DebugLog);
+                let get_err_ctx_local_table_fn =
+                    render_args.require_intrinsic(ErrCtxIntrinsic::GetLocalTable);
+                let err_ctx_ref_count_add_fn =
+                    render_args.require_intrinsic(ErrCtxIntrinsic::GlobalRefCountAdd);
+                let lift_flat_error_fn = self.name();
+                let get_or_create_async_state_fn = render_args.require_intrinsic(
+                    Intrinsic::Component(ComponentIntrinsic::GetOrCreateAsyncState),
+                );
+
+                output.push_str(&format!(r#"
+                    function {lift_flat_error_fn}(errCtxTableIdx, ctx) {{
+                        {debug_log_fn}('[{lift_flat_error_fn}()] ctx', ctx);
+
+                        let val;
+                        let table;
+                        if (ctx.useDirectParams) {{
+                            if (ctx.params.length === 0) {{ throw new Error('expected at least one single i32 argument'); }}
+                            val = ctx.params[0];
+                            ctx.params = ctx.params.slice(1);
+                            table = {get_err_ctx_local_table_fn}(ctx.componentIdx, errCtxTableIdx);
+                        }} else {{
+                            throw new Error('indirect flat lift for error-contexts not yet implemented!');
+                        }}
+
+                        let handle = table.get(val);
+                        if (handle === undefined) {{
+                            throw new Error(`missing  error ctx (handle [${{val}}], component [${{ctx.componentIdx}}], error context table [${{errCtxTableIdx}}])`);
+                        }}
+
+                        const cstate = {get_or_create_async_state_fn}(ctx.componentIdx);
+                        const errCtx = cstate.handles.get(handle);
+                        if (!errCtx || errCtx.globalRep === undefined || errCtx.refCount === undefined) {{
+                            throw new Error(`malformed error context (handle [${{handle}}], component [${{ctx.componentIdx}}])`);
+                        }}
+
+                        errCtx.refCount -= 1;
+                        // NOTE: we aovoid doing clean up eagerly here
+
+                        {err_ctx_ref_count_add_fn}(errCtx.globalRep);
+
+                        return [errCtx.globalRep, ctx];
+                    }}
+                "#));
+            }
+        }
+    }
+}
