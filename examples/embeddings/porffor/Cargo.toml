@@ -1,0 +1,11 @@
+[package]
+name = "porffor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+js-guest-bindgen = { path = "../../.." }
+wit-parser = "0.259.0"
+
+[workspace]

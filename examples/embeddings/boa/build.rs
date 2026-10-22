@@ -1,4 +1,4 @@
-//! Generates the JS bindings for `wit` with js-component-bindgen, and the
+//! Generates the JS bindings for `../../wit` with js-component-bindgen, and the
 //! Rust core exports/imports that connect them to the component model.
 
 use std::fmt::Write as _;
@@ -24,11 +24,11 @@ const OVERRIDDEN_INTRINSICS: &[&str] = &[
 ];
 
 fn main() -> Result<()> {
-    println!("cargo::rerun-if-changed=wit");
+    println!("cargo::rerun-if-changed=../../wit");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
 
     let mut resolve = Resolve::default();
-    let (pkg, _) = resolve.push_path("wit")?;
+    let (pkg, _) = resolve.push_path("../../wit")?;
     let world = resolve.select_world(&[pkg], Some("app"))?;
     let opts = GuestOpts {
         overridden_intrinsics: OVERRIDDEN_INTRINSICS.iter().map(|s| s.to_string()).collect(),

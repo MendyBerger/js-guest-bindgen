@@ -69,7 +69,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "boa-counter"
+name = "boa"
 version = "0.1.0"
 dependencies = [
  "anyhow",

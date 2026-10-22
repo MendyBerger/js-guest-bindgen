@@ -1,5 +1,5 @@
 [package]
-name = "boa-counter"
+name = "boa"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,7 +11,7 @@ boa_engine = { version = "0.22.0", default-features = false }
 
 [build-dependencies]
 anyhow = "1.0.102"
-js-guest-bindgen = { path = "../.." }
+js-guest-bindgen = { path = "../../.." }
 wit-parser = "0.259.0"
 
 [workspace]

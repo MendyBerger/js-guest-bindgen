@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -49,13 +49,17 @@ impl example::counter::logging::HostLogger for State {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let path = std::env::args().nth(1).unwrap_or("../out/component.wasm".into());
+    let path = std::env::args().nth(1).context("usage: test-runner <component.wasm>")?;
     let mut config = Config::new();
+    // wasip3 components need async, and porffor's try/catch needs exceptions
+    config.wasm_component_model_async(true);
+    config.wasm_exceptions(true);
     let engine = Engine::new(&config)?;
     let component = Component::from_file(&engine, &path)?;
 
     let mut linker = Linker::<State>::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
     example::counter::logging::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s)?;
 
     let state = State {

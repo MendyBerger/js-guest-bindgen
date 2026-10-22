@@ -1,4 +1,4 @@
-//! A component implemented in JS (`../app.js`) running on the Boa engine.
+//! A component implemented in JS (`../../../app.js`) running on the Boa engine.
 //!
 //! build.rs generates the JS bindings with js-component-bindgen and the core
 //! exports/imports in Rust. The bindings reach linear memory and the core
@@ -21,7 +21,7 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 const PRELUDE_JS: &str = include_str!("prelude.js");
 const WIT_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/wit.js"));
-const APP_JS: &str = include_str!("../app.js");
+const APP_JS: &str = include_str!("../../../app.js");
 
 // wasi-libc's allocator, which the host's allocations via cabi_realloc also use
 unsafe extern "C" {

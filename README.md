@@ -23,8 +23,15 @@ intrinsics it overrides. See the crate docs for the full contract.
   [snapshot tests](./tests/snapshots) show the JS it produces for a few worlds.
 - [`vendor/js-component-bindgen`](./vendor/js-component-bindgen): the vendored
   fork it is built on (see below).
-- [`examples/boa-counter`](./examples/boa-counter): a component written in JS
-  that runs on the [Boa](https://boajs.dev) engine.
+- [`examples`](./examples): one component written in JS
+  ([`app.js`](./examples/app.js), [`wit`](./examples/wit)), built two ways:
+  - [`embeddings/boa`](./examples/embeddings/boa) runs it on the
+    [Boa](https://boajs.dev) engine.
+  - [`embeddings/porffor`](./examples/embeddings/porffor) compiles it ahead of time
+    with [Porffor](https://porffor.dev).
+  - [`test-runner`](./examples/test-runner) is a wasmtime embedding that
+    tests either build: it provides the `logger` resource and calls every
+    export.
 
 ## Vendored js-component-bindgen
 
