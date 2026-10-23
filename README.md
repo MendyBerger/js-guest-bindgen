@@ -41,6 +41,19 @@ To build each one and run it with the
 WASI_SDK_PATH=path/to/wasi-sdk ./examples/run-all.sh
 ```
 
+## Motivation
+
+There are many JavaScript and TypeScript engines and compilers:
+interpreters, JITs, ahead-of-time compilers, and hybrids of these. Each makes different
+trade-offs between binary size, startup latency, peak throughput, memory use,
+spec compliance, etc. It would be great if all of them could run components.
+
+The hard part of supporting the component model is the bindings: code that
+converts every WIT type between JS values and linear memory. Writing that for
+each engine is a lot of work. js-guest-bindgen generates it once, in JS, so it
+runs on any engine. What's left for each engine is a thin embedding, like the
+three above.
+
 ## Limitations
 
 - Synchronous functions only: async functions, streams and futures are not
