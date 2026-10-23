@@ -6,7 +6,6 @@ cd "$(dirname "$0")"
 : "${WASI_SDK_PATH:?set WASI_SDK_PATH to a wasi-sdk with wasm exceptions}"
 HERMES_BUILD=out/hermes
 HERMES=$HERMES_BUILD/src
-. ../../tools.sh
 CC="$WASI_SDK_PATH/bin/clang --target=wasm32-wasip2 -O2"
 # setjmp/longjmp and C++ exceptions both use wasm exceptions
 EH="-mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false"
@@ -32,6 +31,4 @@ $CC -fwasm-exceptions -mexec-model=reactor out/app.o out/embedding.o out/binding
   -L"$HERMES_BUILD/build-wasm/lib" -L"$HERMES_BUILD/build-wasm/jsi" -lhermesvm_a -ljsi \
   -lc++ -lc++abi -lunwind -lsetjmp -lwasi-emulated-mman -lwasi-emulated-signal \
   -lwasi-emulated-process-clocks -lwasi-emulated-getpid \
-  -Wl,-z,stack-size=1048576 -Wl,--skip-wit-component -o out/core.wasm
-$WASM_TOOLS component embed ../../wit --world app out/core.wasm -o out/core.wasm
-$WASM_TOOLS component new out/core.wasm -o out/component.wasm
+  -Wl,-z,stack-size=1048576 -Wl,--component-type=../../wit/world.wit -o out/component.wasm

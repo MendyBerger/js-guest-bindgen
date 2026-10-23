@@ -2,10 +2,9 @@
 # Builds out/component.wasm, a wasip2 component, from ../../app.js and ../../wit/.
 set -e
 cd "$(dirname "$0")"
-. ../../tools.sh
 
-# the WIT world is embedded below with wasm-tools, not by the linker
-RUSTFLAGS="-Clink-arg=--skip-wit-component" cargo build --release --target wasm32-wasip2
+# the linker makes the component; it needs the world, since nothing here uses wit-bindgen
+cargo rustc --release --target wasm32-wasip2 -- \
+  -Clink-arg=--component-type="$(realpath ../../wit/world.wit)"
 mkdir -p out
-$WASM_TOOLS component embed ../../wit --world app target/wasm32-wasip2/release/boa.wasm -o out/core.wasm
-$WASM_TOOLS component new out/core.wasm -o out/component.wasm
+cp target/wasm32-wasip2/release/boa.wasm out/component.wasm

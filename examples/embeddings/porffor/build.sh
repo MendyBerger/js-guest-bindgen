@@ -4,7 +4,6 @@
 set -e
 cd "$(dirname "$0")"
 : "${WASI_SDK_PATH:?set WASI_SDK_PATH to a wasi-sdk with wasm32-wasip3}"
-. ../../tools.sh
 # the commit porffor/wasi.patch is made against
 PORFFOR_COMMIT=0c135ce2f36fdd3467d5a58daa92283810705a51
 
@@ -23,6 +22,4 @@ node out/porffor/runtime/index.js c --module out/bundle.js -o out/app.c
   -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN \
   -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
   out/app.c -lsetjmp -lwasi-emulated-signal -lwasi-emulated-mman \
-  -Wl,--skip-wit-component -o out/core.wasm
-$WASM_TOOLS component embed ../../wit --world app out/core.wasm -o out/core.wasm
-$WASM_TOOLS component new out/core.wasm -o out/component.wasm
+  -Wl,--component-type=../../wit/world.wit -o out/component.wasm
