@@ -1,0 +1,111 @@
+diff -ruN a/external/llvh/lib/Support/Unix/Path.inc b/external/llvh/lib/Support/Unix/Path.inc
+--- a/external/llvh/lib/Support/Unix/Path.inc
++++ b/external/llvh/lib/Support/Unix/Path.inc
+@@ -199,6 +199,8 @@
+   char link_path[MAXPATHLEN];
+   if (realpath(DLInfo.dli_fname, link_path))
+     return link_path;
++#elif defined(__wasi__)
++  return "";
+ #else
+ #error GetMainExecutable is not implemented on this host yet.
+ #endif
+@@ -379,7 +381,7 @@
+   StringRef fstype(Vfs.f_basetype);
+   // NFS is the only non-local fstype??
+   return !fstype.equals("nfs");
+-#elif defined(__EMSCRIPTEN__)
++#elif defined(__EMSCRIPTEN__) || defined(__wasi__)
+   return false;
+ #else
+   return !!(STATVFS_F_FLAG(Vfs) & MNT_LOCAL);
+diff -ruN a/include/hermes/VM/Profiler/SamplingProfilerDefs.h b/include/hermes/VM/Profiler/SamplingProfilerDefs.h
+--- a/include/hermes/VM/Profiler/SamplingProfilerDefs.h
++++ b/include/hermes/VM/Profiler/SamplingProfilerDefs.h
+@@ -8,7 +8,7 @@
+ #ifndef HERMES_VM_PROFILER_SAMPLINGPROFILERDEFS_H
+ #define HERMES_VM_PROFILER_SAMPLINGPROFILERDEFS_H
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
+ #define HERMESVM_SAMPLING_PROFILER_AVAILABLE 0
+ #else // !defined(__EMSCRIPTEN__)
+ 
+diff -ruN a/lib/Support/OSCompatEmscripten.cpp b/lib/Support/OSCompatEmscripten.cpp
+--- a/lib/Support/OSCompatEmscripten.cpp
++++ b/lib/Support/OSCompatEmscripten.cpp
+@@ -5,7 +5,7 @@
+  * LICENSE file in the root directory of this source tree.
+  */
+ 
+-#ifdef __EMSCRIPTEN__
++#if defined(__EMSCRIPTEN__) || defined(__wasi__)
+ 
+ #include "hermes/Support/ErrorHandling.h"
+ #include "hermes/Support/OSCompat.h"
+@@ -13,7 +13,12 @@
+ #include <cassert>
+ #include <vector>
+ 
++#ifdef __EMSCRIPTEN__
+ #include <emscripten/stack.h>
++#else
++// stack bounds, defined by wasm-ld
++extern "C" char __stack_low, __stack_high;
++#endif
+ #include <signal.h>
+ #include <sys/mman.h>
+ #include <sys/resource.h>
+@@ -219,8 +224,13 @@
+ namespace detail {
+ 
+ std::pair<const void *, size_t> thread_stack_bounds_impl() {
++#ifdef __EMSCRIPTEN__
+   uintptr_t high = emscripten_stack_get_base();
+   uintptr_t low = emscripten_stack_get_end();
++#else
++  uintptr_t high = (uintptr_t)&__stack_high;
++  uintptr_t low = (uintptr_t)&__stack_low;
++#endif
+   size_t sz = high - low;
+   return {(void *)high, sz};
+ }
+diff -ruN a/lib/Support/OSCompatPosix.cpp b/lib/Support/OSCompatPosix.cpp
+--- a/lib/Support/OSCompatPosix.cpp
++++ b/lib/Support/OSCompatPosix.cpp
+@@ -5,7 +5,7 @@
+  * LICENSE file in the root directory of this source tree.
+  */
+ 
+-#if !defined(_WINDOWS) && !defined(__EMSCRIPTEN__)
++#if !defined(_WINDOWS) && !defined(__EMSCRIPTEN__) && !defined(__wasi__)
+ 
+ #include "hermes/Support/Compiler.h"
+ #include "hermes/Support/ErrorHandling.h"
+diff -ruN a/lib/Support/SerialExecutor.cpp b/lib/Support/SerialExecutor.cpp
+--- a/lib/Support/SerialExecutor.cpp
++++ b/lib/Support/SerialExecutor.cpp
+@@ -32,6 +32,11 @@
+ }
+ 
+ void SerialExecutor::add(llvh::unique_function<void()> task) {
++#ifdef __wasi__
++  // no threads: run the task now
++  task();
++  return;
++#endif
+   std::unique_lock<std::mutex> lock(mutex_);
+   // Draining inside ~SerialExecutor destroys tasks, and a task's captured
+   // state may enqueue more work from its destructor. That is fine: the drain
+diff -ruN a/lib/VM/Instrumentation/ProcessStats.cpp b/lib/VM/Instrumentation/ProcessStats.cpp
+--- a/lib/VM/Instrumentation/ProcessStats.cpp
++++ b/lib/VM/Instrumentation/ProcessStats.cpp
+@@ -69,7 +69,7 @@
+   const size_t PS = getpagesize();
+   rss *= PS / 1024;
+   va *= PS / 1024;
+-#elif defined(__EMSCRIPTEN__)
++#elif defined(__EMSCRIPTEN__) || defined(__wasi__)
+   rss = va = 0;
+ #else
+ #error "Unsupported platform"

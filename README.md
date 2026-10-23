@@ -24,14 +24,20 @@ intrinsics it overrides. See the crate docs for the full contract.
 - [`vendor/js-component-bindgen`](./vendor/js-component-bindgen): the vendored
   fork it is built on (see below).
 - [`examples`](./examples): one component written in JS
-  ([`app.js`](./examples/app.js), [`wit`](./examples/wit)), built two ways:
+  ([`app.js`](./examples/app.js), [`wit`](./examples/wit)), built three ways:
   - [`embeddings/boa`](./examples/embeddings/boa) runs it on the
     [Boa](https://boajs.dev) engine.
   - [`embeddings/porffor`](./examples/embeddings/porffor) compiles it ahead of time
     with [Porffor](https://porffor.dev).
+  - [`embeddings/static-hermes`](./examples/embeddings/static-hermes)
+    compiles it ahead of time with
+    [Static Hermes](https://github.com/facebook/hermes) and runs it on the
+    Hermes VM.
   - [`test-runner`](./examples/test-runner) is a wasmtime embedding that
-    tests either build: it provides the `logger` resource and calls every
+    tests each build: it provides the `logger` resource and calls every
     export.
+  - [`run-all.sh`](./examples/run-all.sh) builds every embedding and runs it
+    with the test runner.
 
 ## Vendored js-component-bindgen
 

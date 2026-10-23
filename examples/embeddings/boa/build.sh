@@ -2,7 +2,7 @@
 # Builds out/component.wasm, a wasip2 component, from ../../app.js and ../../wit/.
 set -e
 cd "$(dirname "$0")"
-WASM_TOOLS=${WASM_TOOLS:-wasm-tools}
+. ../../tools.sh
 
 # the WIT world is embedded below with wasm-tools, not by the linker
 RUSTFLAGS="-Clink-arg=--skip-wit-component" cargo build --release --target wasm32-wasip2

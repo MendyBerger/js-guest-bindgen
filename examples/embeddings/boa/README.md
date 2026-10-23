@@ -21,11 +21,10 @@ between calls.
 
 ## Build and run
 
-Requires the `wasm32-wasip2` Rust target and [`wasm-tools`][wasm-tools].
+Requires the `wasm32-wasip2` Rust target.
 
 ```sh
 ./build.sh
 cd ../../test-runner && cargo run -- ../embeddings/boa/out/component.wasm
 ```
 
-[wasm-tools]: https://github.com/bytecodealliance/wasm-tools

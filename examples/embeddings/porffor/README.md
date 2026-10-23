@@ -17,17 +17,17 @@ wasm with wasi-sdk.
   they use.
 
 The component targets `wasm32-wasip3`, with wasm exceptions for porffor's
-`try`/`catch`.
+`try`/`catch`. `build.sh` downloads a pinned porffor commit to `out/porffor`
+and applies [`porffor/wasi.patch`](./porffor/wasi.patch), which stops porffor's
+runtime from passing `MAP_NORESERVE` to wasi-libc's emulated `mmap`.
 
 ## Build and run
 
-Requires a [porffor](https://github.com/CanadaHonk/porffor) checkout,
-[wasi-sdk][wasi-sdk] with `wasm32-wasip3` support,
-[`wasm-tools`][wasm-tools] 1.262 or newer, and Node.js for porffor and
-esbuild.
+Requires [wasi-sdk][wasi-sdk] with `wasm32-wasip3` support, and Node.js for
+porffor and esbuild.
 
 ```sh
-PORFFOR=path/to/porffor WASI_SDK_PATH=path/to/wasi-sdk ./build.sh
+WASI_SDK_PATH=path/to/wasi-sdk ./build.sh
 cd ../../test-runner && cargo run -- ../embeddings/porffor/out/component.wasm
 ```
 
@@ -36,4 +36,3 @@ cd ../../test-runner && cargo run -- ../embeddings/porffor/out/component.wasm
 builds `out/component.wasm` from that.
 
 [wasi-sdk]: https://github.com/WebAssembly/wasi-sdk
-[wasm-tools]: https://github.com/bytecodealliance/wasm-tools
