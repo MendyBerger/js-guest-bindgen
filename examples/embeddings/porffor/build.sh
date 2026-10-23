@@ -18,8 +18,8 @@ cargo run -q -- ../../wit --source ../../app.js --out-dir out
 npx -y esbuild@0.28.2 out/main.js --bundle --format=esm --platform=neutral \
   --outfile=out/bundle.js --log-level=warning $(cat out/esbuild-aliases.txt)
 node out/porffor/runtime/index.js c --module out/bundle.js -o out/app.c
-"$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip3 -mexec-model=reactor -O2 \
+"$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip3 -mexec-model=reactor -O3 -DNDEBUG \
   -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN \
   -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false \
   out/app.c -lsetjmp -lwasi-emulated-signal -lwasi-emulated-mman \
-  -Wl,--component-type=../../wit/world.wit -o out/component.wasm
+  -Wl,--strip-debug -Wl,--component-type=../../wit/world.wit -o out/component.wasm

@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 : "${WASI_SDK_PATH:?set WASI_SDK_PATH to a wasi-sdk with wasm exceptions}"
 HERMES_BUILD=out/hermes
 HERMES=$HERMES_BUILD/src
-CC="$WASI_SDK_PATH/bin/clang --target=wasm32-wasip2 -O2"
+CC="$WASI_SDK_PATH/bin/clang --target=wasm32-wasip2 -O3 -DNDEBUG"
 # setjmp/longjmp and C++ exceptions both use wasm exceptions
 EH="-mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false"
 
@@ -19,8 +19,8 @@ npx -y esbuild@0.28.2 out/main.js --bundle --format=iife --platform=neutral \
   --outfile=out/bundle.js --log-level=warning $(cat out/esbuild-aliases.txt)
 "$HERMES_BUILD/build-host/bin/shermes" -emit-c -exported-unit=app -o out/app.c out/bundle.js
 
-# the unit must be built with the same NDEBUG as the VM, which is a release build
-$CC $EH -DNDEBUG -fno-strict-aliasing -fno-strict-overflow \
+# NDEBUG must match the VM's, which is a release build
+$CC $EH -fno-strict-aliasing -fno-strict-overflow \
   -I"$HERMES_BUILD/build-wasm/lib/config" -I"$HERMES/include" -c out/app.c -o out/app.o
 for f in src/embedding.cpp out/bindings.cpp; do
   $CC $EH -x c++ -std=c++17 -fwasm-exceptions -Isrc -I"$HERMES/API" -I"$HERMES/API/jsi" \
@@ -31,4 +31,4 @@ $CC -fwasm-exceptions -mexec-model=reactor out/app.o out/embedding.o out/binding
   -L"$HERMES_BUILD/build-wasm/lib" -L"$HERMES_BUILD/build-wasm/jsi" -lhermesvm_a -ljsi \
   -lc++ -lc++abi -lunwind -lsetjmp -lwasi-emulated-mman -lwasi-emulated-signal \
   -lwasi-emulated-process-clocks -lwasi-emulated-getpid \
-  -Wl,-z,stack-size=1048576 -Wl,--component-type=../../wit/world.wit -o out/component.wasm
+  -Wl,-z,stack-size=1048576 -Wl,--strip-debug -Wl,--component-type=../../wit/world.wit -o out/component.wasm
