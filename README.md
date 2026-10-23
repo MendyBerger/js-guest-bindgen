@@ -1,65 +1,55 @@
 # js-guest-bindgen
 
-Generates bindings for JavaScript that runs *inside* a WebAssembly component,
-on a JS engine embedded in the guest. It is built on
-[jco](https://github.com/bytecodealliance/jco)'s `js-component-bindgen`, and
-adapted from
-[ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS)'s
-`spidermonkey-embedding-splicer` bindgen.
+A tool for bringing your own JavaScript engine to WASI and the component
+model with minimal effort. For a WIT world, it generates the JS bindings that
+lift and lower every import and export, so an engine only needs a thin
+embedding to run JS as a component. It is built almost entirely from existing
+code in [jco](https://github.com/bytecodealliance/jco) and
+[ComponentizeJS](https://github.com/bytecodealliance/ComponentizeJS).
 
-For a WIT world, [`guest_bindgen`](./src/lib.rs)
-returns:
+## Where the code comes from
 
-- JS that lifts and lowers every import and export, handles resources, and
-  checks the user's module exports what the world requires
-- the core function signatures the embedding has to provide or call
+- [`src/lib.rs`](./src/lib.rs) is ComponentizeJS's
+  [`spidermonkey-embedding-splicer` bindgen](https://github.com/bytecodealliance/ComponentizeJS/blob/7df33dd/crates/spidermonkey-embedding-splicer/src/bindgen.rs),
+  with the SpiderMonkey-specific parts made into options (about 170 lines
+  added and 90 removed, out of about 1,500, many of them doc comments).
+- [`vendor/js-component-bindgen`](./vendor/js-component-bindgen) is jco's
+  `js-component-bindgen` 2.16.0 from crates.io, with one change: memory is
+  read and written through overridable `dataView`, `memoryView` and
+  `memoryWrite` helpers instead of directly, since an engine may not be able
+  to view linear memory as an `ArrayBuffer` (35 lines added, 7 removed, each
+  marked `FORK(js-guest-bindgen)`).
 
-The embedding supplies the core exports and imports, memory access and any
-intrinsics it overrides. See the crate docs for the full contract.
+## Embeddings
 
-## Layout
+The same component, [`examples/app.js`](./examples/app.js) implementing
+[`examples/wit`](./examples/wit) (an exported and an imported resource), on
+three engines:
 
-- [`src`](./src): the generator. Its
-  [snapshot tests](./tests/snapshots) show the JS it produces for a few worlds.
-- [`vendor/js-component-bindgen`](./vendor/js-component-bindgen): the vendored
-  fork it is built on (see below).
-- [`examples`](./examples): one component written in JS
-  ([`app.js`](./examples/app.js), [`wit`](./examples/wit)), built three ways:
-  - [`embeddings/boa`](./examples/embeddings/boa) runs it on the
-    [Boa](https://boajs.dev) engine.
-  - [`embeddings/porffor`](./examples/embeddings/porffor) compiles it ahead of time
-    with [Porffor](https://porffor.dev).
-  - [`embeddings/static-hermes`](./examples/embeddings/static-hermes)
-    compiles it ahead of time with
-    [Static Hermes](https://github.com/facebook/hermes) and runs it on the
-    Hermes VM.
-  - [`test-runner`](./examples/test-runner) is a wasmtime embedding that
-    tests each build: it provides the `logger` resource and calls every
-    export.
-  - [`run-all.sh`](./examples/run-all.sh) builds every embedding and runs it
-    with the test runner.
+- [`boa`](./examples/embeddings/boa): [Boa](https://boajs.dev), an
+  interpreter written in Rust, embedded in a Rust component.
+- [`porffor`](./examples/embeddings/porffor): [Porffor](https://porffor.dev),
+  which compiles the JS ahead of time to C.
+- [`static-hermes`](./examples/embeddings/static-hermes):
+  [Static Hermes](https://github.com/facebook/hermes), which compiles the JS
+  ahead of time to C that runs on the Hermes VM.
 
-## Vendored js-component-bindgen
-
-[`vendor/js-component-bindgen`](./vendor/js-component-bindgen) is a copy of
-`js-component-bindgen` 2.16.0 from crates.io with the guest memory hooks added
-(the `memoryView` and `memoryWrite` intrinsics, and `dataView` for list
-lowering), since they are not in a release. Every change to the original is
-marked with a `FORK(js-guest-bindgen)` comment:
+To build each one and run it with the
+[wasmtime test runner](./examples/test-runner):
 
 ```sh
-grep -rn "FORK(js-guest-bindgen)" vendor/js-component-bindgen
+WASI_SDK_PATH=path/to/wasi-sdk ./examples/run-all.sh
 ```
 
-It is `publish = false`, so js-guest-bindgen cannot be published to crates.io
-until the hooks are released or the fork is published under its own name.
+## Limitations
 
-## Tests
+- Synchronous functions only: async functions, streams and futures are not
+  supported yet.
+- Strings must be UTF-8.
+- The example embeddings don't support 64-bit integers, and copy lists and
+  strings in and out of linear memory, since none of their engines can view
+  it as an `ArrayBuffer`.
+- The vendored `js-component-bindgen` is not published, so neither is this
+  crate.
 
-```sh
-cargo test
-# also run the vendored fork's tests:
-cargo test --workspace
-# after an intended change to the generated JS:
-BLESS=1 cargo test --test snapshots
-```
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for how the pieces fit together.
